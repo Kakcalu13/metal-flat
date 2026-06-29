@@ -15,7 +15,8 @@ endif()
 add_library(metalflat STATIC
     src/FlatIndex.mm
     src/GemmDistance.mm
-    src/IvfIndex.mm)
+    src/IvfIndex.mm
+    src/IvfPqIndex.mm)
 target_include_directories(metalflat PUBLIC include)
 target_include_directories(metalflat PRIVATE src)
 target_compile_options(metalflat PRIVATE -fobjc-arc)
