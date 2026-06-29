@@ -1,4 +1,5 @@
 build/
+temp/
 *.o
 *.metallib
 .DS_Store
