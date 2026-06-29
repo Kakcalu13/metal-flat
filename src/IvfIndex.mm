@@ -55,14 +55,18 @@ struct IvfParams { uint dim; uint k; uint nprobe; uint metric; uint queryCount; 
 
 constant uint kMaxK = 64;
 
-// One thread per query. Scans only the query's probed cells (their
-// contiguous CSR blocks), computing the metric directly and keeping a
-// local top-k by insertion. Cell membership ids come back via
-// reorderedIds, so output ids are the caller's original indices. L2
-// ranks by -dist², so one path serves all metrics; cosine arrives as
-// dot products over already-normalized vectors.
+// One THREADGROUP per query (cooperative). The tg's threads split the
+// query's probed-cell vectors round-robin, each keeping a register top-k;
+// then a threadgroup reduction merges the per-thread top-k lists into the
+// final top-k. The query is staged in threadgroup memory once. This
+// replaces the old one-thread-per-query kernel (which left the GPU ~99%
+// idle and serialized every cell). Cell membership ids come back via
+// reorderedIds, so output ids are the caller's original indices. L2 ranks
+// by -dist², so one path serves all metrics; cosine arrives as dot
+// products over already-normalized vectors. Threadgroup buffers: qsh[dim],
+// redScore[tgSize*k], redId[tgSize*k] (sizes set by the host).
 kernel void ivf_scan(
-    device const float* reorderedDb  [[buffer(0)]],
+    device const half*  reorderedDb  [[buffer(0)]],   // fp16 storage (half BW)
     device const int*   reorderedIds [[buffer(1)]],
     device const int*   cellStart    [[buffer(2)]],
     device const float* queries      [[buffer(3)]],
@@ -70,34 +74,55 @@ kernel void ivf_scan(
     device int*         outIds       [[buffer(5)]],
     device float*       outVal       [[buffer(6)]],
     constant IvfParams& p            [[buffer(7)]],
-    uint                qi           [[thread_position_in_grid]])
+    threadgroup float*  qsh          [[threadgroup(0)]],   // dim
+    threadgroup float*  redScore     [[threadgroup(1)]],   // tgSize × k
+    threadgroup int*    redId        [[threadgroup(2)]],   // tgSize × k
+    uint                qi           [[threadgroup_position_in_grid]],
+    uint                tid          [[thread_position_in_threadgroup]],
+    uint                tgs          [[threads_per_threadgroup]])
 {
     if (qi >= p.queryCount) return;
     const uint dim  = p.dim;
     const uint k    = min(p.k, kMaxK);
     const bool isL2 = (p.metric == 0u);
-    device const float* q = queries + (uint64_t)qi * dim;
+
+    // Stage the query in threadgroup memory once (read by every thread).
+    device const float* qg = queries + (uint64_t)qi * dim;
+    for (uint c = tid; c < dim; c += tgs) qsh[c] = qg[c];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float bestScore[kMaxK];
     int   bestId[kMaxK];
     for (uint i = 0; i < k; ++i) { bestScore[i] = -INFINITY; bestId[i] = -1; }
 
+    // Each thread scans a strided subset of every probed cell's block.
     device const int* myCells = probedCells + (uint64_t)qi * p.nprobe;
     for (uint pp = 0; pp < p.nprobe; ++pp) {
         const int cell = myCells[pp];
         if (cell < 0) continue;
         const int lo = cellStart[cell];
         const int hi = cellStart[cell + 1];
-        for (int j = lo; j < hi; ++j) {
-            device const float* d = reorderedDb + (uint64_t)j * dim;
+        for (int j = lo + (int)tid; j < hi; j += (int)tgs) {
+            device const half* d = reorderedDb + (uint64_t)j * dim;
             float score;
-            if (isL2) {
+            if ((dim & 3u) == 0u) {
+                // 64-bit half4 loads (dim%4==0 => each row is 8-byte aligned);
+                // db is fp16, query/accumulation stay fp32.
+                const uint c4 = dim >> 2;
+                threadgroup const float4* q4 = (threadgroup const float4*)qsh;
+                device const half4*       d4 = (device const half4*)d;
+                float4 acc = float4(0.0);
+                if (isL2) { for (uint c = 0; c < c4; ++c) { float4 e = q4[c] - float4(d4[c]); acc += e * e; } }
+                else      { for (uint c = 0; c < c4; ++c) acc += q4[c] * float4(d4[c]); }
+                float s = acc.x + acc.y + acc.z + acc.w;
+                score = isL2 ? -s : s;
+            } else if (isL2) {
                 float acc = 0.0;
-                for (uint c = 0; c < dim; ++c) { float e = q[c] - d[c]; acc += e * e; }
+                for (uint c = 0; c < dim; ++c) { float e = qsh[c] - float(d[c]); acc += e * e; }
                 score = -acc;
             } else {
                 float acc = 0.0;
-                for (uint c = 0; c < dim; ++c) acc += q[c] * d[c];
+                for (uint c = 0; c < dim; ++c) acc += qsh[c] * float(d[c]);
                 score = acc;
             }
             if (score > bestScore[0]) {
@@ -113,12 +138,44 @@ kernel void ivf_scan(
         }
     }
 
-    device int*   oi = outIds + (uint64_t)qi * k;
-    device float* ov = outVal + (uint64_t)qi * k;
+    // Publish this thread's top-k (ascending) and tree-merge across the
+    // threadgroup: log2(tgs) steps, each merging two ascending top-k lists and
+    // keeping the k largest. Candidate sets are disjoint, so no dedup. Requires
+    // a power-of-two threadgroup size (the host guarantees it).
     for (uint i = 0; i < k; ++i) {
-        uint src = k - 1u - i;
-        oi[i] = bestId[src];
-        ov[i] = isL2 ? -bestScore[src] : bestScore[src];
+        redScore[tid * k + i] = bestScore[i];
+        redId[tid * k + i]    = bestId[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint off = tgs >> 1; off > 0u; off >>= 1) {
+        if (tid < off) {
+            threadgroup float* aS = redScore + tid * k;
+            threadgroup int*   aI = redId    + tid * k;
+            threadgroup float* bS = redScore + (tid + off) * k;
+            threadgroup int*   bI = redId    + (tid + off) * k;
+            float mS[kMaxK];
+            int   mI[kMaxK];
+            int ia = (int)k - 1, ib = (int)k - 1;
+            for (int o = (int)k - 1; o >= 0; --o) {     // fill from the largest
+                const float av = (ia >= 0) ? aS[ia] : -INFINITY;
+                const float bv = (ib >= 0) ? bS[ib] : -INFINITY;
+                if (av >= bv) { mS[o] = av; mI[o] = (ia >= 0) ? aI[ia] : -1; --ia; }
+                else          { mS[o] = bv; mI[o] = (ib >= 0) ? bI[ib] : -1; --ib; }
+            }
+            for (uint i = 0; i < k; ++i) { aS[i] = mS[i]; aI[i] = mI[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        device int*   oi = outIds + (uint64_t)qi * k;
+        device float* ov = outVal + (uint64_t)qi * k;
+        for (uint i = 0; i < k; ++i) {
+            uint src = k - 1u - i;   // redScore[0..k) ascending -> output descending
+            oi[i] = redId[src];
+            ov[i] = isL2 ? -redScore[src] : redScore[src];
+        }
     }
 }
 )";
@@ -203,6 +260,91 @@ void kmeans(const float* data, int n, int dim, int nlist, int iters,
     }
 }
 
+// Per-thread partial accumulation of centroid sums, then merge — avoids the
+// write contention (and the single-threaded O(N*D)/iter floor) of a shared
+// sums[] array. Empty cells are reseeded from a random point (same policy as
+// the scalar kmeans()).
+void accumulateCentroids(const float* data, int n, int dim, int nlist,
+                         const std::vector<int>& assign,
+                         std::vector<float>& centroids, std::mt19937& rng) {
+    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::vector<double>> tsums(
+        nt, std::vector<double>(static_cast<size_t>(nlist) * dim, 0.0));
+    std::vector<std::vector<int>> tcnt(nt, std::vector<int>(nlist, 0));
+    const int chunk = (n + static_cast<int>(nt) - 1) / static_cast<int>(nt);
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < nt; ++t) {
+        const int lo = static_cast<int>(t) * chunk;
+        const int hi = std::min(n, lo + chunk);
+        if (lo >= hi) continue;
+        pool.emplace_back([&, t, lo, hi] {
+            auto& s = tsums[t]; auto& cnt = tcnt[t];
+            for (int i = lo; i < hi; ++i) {
+                const float* v = data + static_cast<size_t>(i) * dim;
+                const int c = assign[i];
+                double* sc = &s[static_cast<size_t>(c) * dim];
+                for (int d = 0; d < dim; ++d) sc[d] += v[d];
+                ++cnt[c];
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+    parallelFor(nlist, [&](int c) {
+        long cnt = 0;
+        for (unsigned t = 0; t < nt; ++t) cnt += tcnt[t][c];
+        float* ce = &centroids[static_cast<size_t>(c) * dim];
+        if (cnt > 0) {
+            for (int d = 0; d < dim; ++d) {
+                double acc = 0.0;
+                for (unsigned t = 0; t < nt; ++t)
+                    acc += tsums[t][static_cast<size_t>(c) * dim + d];
+                ce[d] = static_cast<float>(acc / static_cast<double>(cnt));
+            }
+        }
+    });
+    // Reseed empty cells serially (rng is not thread-safe; empties are rare).
+    for (int c = 0; c < nlist; ++c) {
+        long cnt = 0;
+        for (unsigned t = 0; t < nt; ++t) cnt += tcnt[t][c];
+        if (cnt == 0) {
+            const int r = static_cast<int>(rng() % static_cast<unsigned>(n));
+            std::copy_n(data + static_cast<size_t>(r) * dim, dim,
+                        &centroids[static_cast<size_t>(c) * dim]);
+        }
+    }
+}
+
+// GPU-accelerated k-means: the assignment step (the ~O(N*nlist*D) bottleneck)
+// is done by a reused FlatIndex over the centroids (search data, k=1) — i.e.
+// the near-peak MPS GEMM path — instead of a scalar CPU triple loop. Centroid
+// update stays on the CPU (parallelized). `assignOut` is left consistent with
+// the FINAL centroids so build() can use it directly (no redundant pass).
+void kmeansGpu(const float* data, int n, int dim, int nlist, int iters,
+               std::vector<float>& centroids, std::vector<int>& assignOut) {
+    centroids.assign(static_cast<size_t>(nlist) * dim, 0.0f);
+    std::mt19937 rng(12345);
+    std::vector<int> perm(n);
+    for (int i = 0; i < n; ++i) perm[i] = i;
+    std::shuffle(perm.begin(), perm.end(), rng);
+    for (int c = 0; c < nlist; ++c)
+        std::copy_n(data + static_cast<size_t>(perm[c]) * dim, dim,
+                    centroids.begin() + static_cast<size_t>(c) * dim);
+
+    FlatIndex assigner(dim, Metric::L2);
+    assignOut.assign(n, 0);
+    auto assignNow = [&] {
+        assigner.reset();
+        assigner.add(centroids.data(), nlist);          // tiny: nlist x dim
+        SearchResult r = assigner.search(data, n, 1);    // nearest centroid, GEMM
+        for (int i = 0; i < n; ++i) assignOut[i] = r.ids[static_cast<size_t>(i)];
+    };
+    for (int it = 0; it < iters; ++it) {
+        assignNow();
+        accumulateCentroids(data, n, dim, nlist, assignOut, centroids, rng);
+    }
+    assignNow();  // final assignment consistent with the updated centroids
+}
+
 // Same robustness fallback as FlatIndex — some session contexts return
 // nil from MTLCreateSystemDefaultDevice even with a GPU present.
 id<MTLDevice> acquireMetalDevice() {
@@ -232,7 +374,7 @@ struct IvfIndex::Impl {
     id<MTLCommandQueue>         queue   = nil;
     id<MTLComputePipelineState> scanPipe = nil;
     std::unique_ptr<FlatIndex>  coarse;          // exact search over centroids
-    id<MTLBuffer>               dbBuf    = nil;   // reorderedDb
+    id<MTLBuffer>               dbBuf    = nil;   // reorderedDb as fp16 (half)
     id<MTLBuffer>               idBuf    = nil;   // reorderedIds
     id<MTLBuffer>               cellBuf  = nil;   // cellStart
     bool                        gpuReady = false;
@@ -284,19 +426,27 @@ void IvfIndex::build(const float* vectors, int n) {
     mImpl->nlist = nlist;
 
     constexpr int kIters = 12;
-    kmeans(data.data(), n, dim, nlist, kIters, mImpl->centroids);
-
-    std::vector<int> assign(n, 0);
-    parallelFor(n, [&](int i) {
-        const float* v = &data[static_cast<size_t>(i) * dim];
-        float best = std::numeric_limits<float>::infinity();
-        int   bestC = 0;
-        for (int c = 0; c < nlist; ++c) {
-            float dd = sqL2(v, &mImpl->centroids[static_cast<size_t>(c) * dim], dim);
-            if (dd < best) { best = dd; bestC = c; }
-        }
-        assign[i] = bestC;
-    });
+    std::vector<int> assign;
+    if (mImpl->scanPipe) {
+        // GPU k-means: the assignment step runs on the MPS GEMM path via a
+        // reused FlatIndex; assign[] comes back consistent with the final
+        // centroids, so no separate CPU assignment pass is needed.
+        kmeansGpu(data.data(), n, dim, nlist, kIters, mImpl->centroids, assign);
+    } else {
+        // No Metal device: scalar CPU k-means + one assignment pass.
+        kmeans(data.data(), n, dim, nlist, kIters, mImpl->centroids);
+        assign.assign(n, 0);
+        parallelFor(n, [&](int i) {
+            const float* v = &data[static_cast<size_t>(i) * dim];
+            float best = std::numeric_limits<float>::infinity();
+            int   bestC = 0;
+            for (int c = 0; c < nlist; ++c) {
+                float dd = sqL2(v, &mImpl->centroids[static_cast<size_t>(c) * dim], dim);
+                if (dd < best) { best = dd; bestC = c; }
+            }
+            assign[i] = bestC;
+        });
+    }
 
     mImpl->cellStart.assign(nlist + 1, 0);
     for (int i = 0; i < n; ++i) ++mImpl->cellStart[assign[i] + 1];
@@ -322,9 +472,15 @@ void IvfIndex::build(const float* vectors, int n) {
         mImpl->coarse = std::make_unique<FlatIndex>(dim, Metric::L2);
         mImpl->coarse->add(mImpl->centroids.data(), nlist);
 
+        // Upload the database as fp16 (halves the scan's memory traffic; the
+        // CPU keeps the fp32 copy for the reference path). Lossless for inputs
+        // exactly representable in half (e.g. SIFT's small integers).
+        std::vector<__fp16> dbHalf(mImpl->reorderedDb.size());
+        for (size_t i = 0; i < dbHalf.size(); ++i)
+            dbHalf[i] = static_cast<__fp16>(mImpl->reorderedDb[i]);
         mImpl->dbBuf = [mImpl->device
-            newBufferWithBytes:mImpl->reorderedDb.data()
-                        length:mImpl->reorderedDb.size() * sizeof(float)
+            newBufferWithBytes:dbHalf.data()
+                        length:dbHalf.size() * sizeof(__fp16)
                        options:MTLResourceStorageModeShared];
         mImpl->idBuf = [mImpl->device
             newBufferWithBytes:mImpl->reorderedIds.data()
@@ -404,7 +560,8 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
     const int dim   = mImpl->dim;
     const int nlist = mImpl->nlist;
     if (k < 1) k = 1;
-    if (k > kMaxK) k = kMaxK;
+    // k > kMaxK is served by the exact CPU path below (the GPU top-k uses
+    // fixed kMaxK-sized per-thread buffers); not clamped, so results stay correct.
     if (nprobe < 1) nprobe = 1;
     if (nprobe > nlist) nprobe = nlist;
 
@@ -424,9 +581,13 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
         qPtr = qNorm.data();
     }
 
-    // GPU path needs the coarse k = nprobe within FlatIndex::kMaxK.
-    const bool gpuPath = mImpl->gpuReady && mImpl->coarse &&
-                         nprobe <= FlatIndex::kMaxK;
+    // The GPU fine scan runs for ANY nprobe. Only the coarse cell-selection is
+    // bounded by FlatIndex::kMaxK (its GPU top-k), so: for nprobe<=kMaxK use the
+    // GPU coarse quantizer; for larger nprobe select the nprobe nearest
+    // centroids on the CPU (partial_sort over the small nlist) and feed the same
+    // nprobe-agnostic ivf_scan kernel. No more CPU-only cliff (and recall cap)
+    // at nprobe=64.
+    const bool gpuPath = mImpl->gpuReady && mImpl->coarse && k <= kMaxK;
     if (!gpuPath) {
         searchCpu(mImpl->centroids, mImpl->cellStart, mImpl->reorderedDb,
                   mImpl->reorderedIds, dim, nlist, mImpl->metric,
@@ -434,11 +595,27 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
         return out;
     }
 
-    // --- coarse: nprobe nearest centroids per query (exact, on GPU) ---
-    // FlatIndex(L2) over the centroids; pre-normalized queries for cosine
-    // are passed as-is (L2 over unit vectors = nearest by cosine).
-    SearchResult coarse = mImpl->coarse->search(qPtr, m, nprobe);
-    // coarse.ids are cell indices (m × nprobe).
+    // Build the m × nprobe probed-cell list (cell indices), GPU or CPU coarse.
+    SearchResult coarse;             // owns storage for the GPU coarse path
+    std::vector<int32_t> probedCpu;  // owns storage for the CPU coarse path
+    const int32_t* probedPtr = nullptr;
+    if (nprobe <= FlatIndex::kMaxK) {
+        coarse = mImpl->coarse->search(qPtr, m, nprobe);  // exact, on GPU
+        probedPtr = coarse.ids.data();
+    } else {
+        probedCpu.assign(static_cast<size_t>(m) * nprobe, -1);
+        const std::vector<float>& cents = mImpl->centroids;
+        parallelFor(m, [&](int qi) {
+            const float* q = qPtr + static_cast<size_t>(qi) * dim;
+            std::vector<std::pair<float, int>> cd(nlist);
+            for (int c = 0; c < nlist; ++c)
+                cd[c] = {sqL2(q, &cents[static_cast<size_t>(c) * dim], dim), c};
+            std::partial_sort(cd.begin(), cd.begin() + nprobe, cd.end());
+            int32_t* row = &probedCpu[static_cast<size_t>(qi) * nprobe];
+            for (int p = 0; p < nprobe; ++p) row[p] = cd[p].second;
+        });
+        probedPtr = probedCpu.data();
+    }
 
     @autoreleasepool {
         id<MTLBuffer> qBuf = [mImpl->device
@@ -446,8 +623,8 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
                         length:static_cast<size_t>(m) * dim * sizeof(float)
                        options:MTLResourceStorageModeShared];
         id<MTLBuffer> probedBuf = [mImpl->device
-            newBufferWithBytes:coarse.ids.data()
-                        length:coarse.ids.size() * sizeof(int32_t)
+            newBufferWithBytes:probedPtr
+                        length:static_cast<size_t>(m) * nprobe * sizeof(int32_t)
                        options:MTLResourceStorageModeShared];
         id<MTLBuffer> outIdBuf = [mImpl->device
             newBufferWithLength:static_cast<size_t>(m) * k * sizeof(int32_t)
@@ -474,10 +651,27 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
         [enc setBuffer:outIdBuf       offset:0 atIndex:5];
         [enc setBuffer:outValBuf      offset:0 atIndex:6];
         [enc setBytes:&p length:sizeof(p) atIndex:7];
-        const NSUInteger tg = std::min<NSUInteger>(
-            64, mImpl->scanPipe.maxTotalThreadsPerThreadgroup);
-        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(m), 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        // One threadgroup per query. Pick the largest threadgroup whose
+        // staged query (dim floats) + reduction scratch (tg × k × (float+int))
+        // fits the threadgroup-memory budget; round to a SIMD-width multiple.
+        const NSUInteger kk  = static_cast<NSUInteger>(k);
+        const NSUInteger qsh = static_cast<NSUInteger>(dim) * sizeof(float);
+        NSUInteger memTg = (qsh < 32000)
+            ? (32000 - qsh) / (kk * (sizeof(float) + sizeof(int)))
+            : 1;
+        NSUInteger tg = std::min<NSUInteger>(
+            mImpl->scanPipe.maxTotalThreadsPerThreadgroup, 256);
+        tg = std::min<NSUInteger>(tg, std::max<NSUInteger>(memTg, 32));
+        // Floor to a power of two — the tree-merge reduction requires it.
+        NSUInteger pw = 32;
+        while (pw * 2 <= tg) pw *= 2;
+        tg = pw;
+
+        [enc setThreadgroupMemoryLength:qsh atIndex:0];
+        [enc setThreadgroupMemoryLength:tg * kk * sizeof(float) atIndex:1];
+        [enc setThreadgroupMemoryLength:tg * kk * sizeof(int)   atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(m), 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
