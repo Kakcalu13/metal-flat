@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // metalflat/include/metalflat/FlatIndex.h
 //
 // MetalFlat — GPU-accelerated flat (exact, brute-force) vector search

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MetalFlat — IvfIndex implementation.
 //
 // Build: k-means clusters the database into nlist cells, then every

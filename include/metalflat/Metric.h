@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // metalflat/include/metalflat/Metric.h
 //
 // Distance / similarity metrics for flat (exact) search.

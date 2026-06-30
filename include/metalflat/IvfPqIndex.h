@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // metalflat/include/metalflat/IvfPqIndex.h
 //
 // MetalFlat — GPU IVFPQ: inverted-file index with Product Quantization.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MetalFlat — FlatIndex implementation (Objective-C++ / Metal).
 //
 // Search = tiled GEMM + running top-k. The database is processed in

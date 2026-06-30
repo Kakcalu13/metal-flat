@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MetalFlat — IvfPqIndex implementation (IVF + Product Quantization).
 //
 // Build:
