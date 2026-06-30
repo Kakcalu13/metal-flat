@@ -1,9 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
 // MetalFlat — standalone bench + correctness harness.
 //
 // Generates random data, runs the GPU FlatIndex against an independent
 // CPU brute-force reference, and reports recall + timing. This is the
 // "prove it's correct AND fast" artifact — runnable on any M-series Mac
-// with no dependency on duhthusam.
+// with no third-party dependencies.
 //
 //   ./metalflat_bench                  # defaults
 //   ./metalflat_bench N D M k          # custom sizes
