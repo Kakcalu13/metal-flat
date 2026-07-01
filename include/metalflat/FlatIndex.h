@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // metalflat/include/metalflat/FlatIndex.h
 //
 // MetalFlat — GPU-accelerated flat (exact, brute-force) vector search
@@ -37,7 +38,8 @@ class FlatIndex {
 public:
     // Largest k the GPU path supports in v0 (fixed per-thread top-k
     // buffers). Requests above this are clamped; documented, not silent
-    // — search() leaves a one-time note on stderr if it clamps.
+    // — search() emits a one-time Warn via the log handler (default: stderr;
+    // see metalflat/Log.h).
     static constexpr int kMaxK = 64;
 
     FlatIndex(int dim, Metric metric);

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // metal-flat/src/GemmDistance.h  (internal — NOT part of the public API)
 //
 // Computes the dense query×database dot-product matrix G = Q · Dᵀ on the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MetalFlat — FlatIndex implementation (Objective-C++ / Metal).
 //
 // Search = tiled GEMM + running top-k. The database is processed in
@@ -28,6 +29,7 @@
 
 #include "metalflat/FlatIndex.h"
 #include "GemmDistance.h"
+#include "Log_internal.h"
 
 namespace mflat {
 
@@ -212,7 +214,7 @@ FlatIndex::FlatIndex(int dim, Metric metric)
 
     mImpl->device = acquireMetalDevice();
     if (!mImpl->device) {
-        fprintf(stderr, "[metalflat] no Metal device — using CPU fallback\n");
+        MFLAT_LOG_INFO("no Metal device — using CPU fallback");
         return;
     }
     mImpl->queue = [mImpl->device newCommandQueue];
@@ -222,22 +224,22 @@ FlatIndex::FlatIndex(int dim, Metric metric)
                                                      options:nil
                                                        error:&err];
     if (!lib) {
-        fprintf(stderr, "[metalflat] shader compile failed: %s\n",
-                err ? [[err localizedDescription] UTF8String] : "?");
+        MFLAT_LOG_ERROR("shader compile failed: %s",
+                        err ? [[err localizedDescription] UTF8String] : "?");
         return;
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"topk_merge"];
     mImpl->mergePipe = [mImpl->device newComputePipelineStateWithFunction:fn
                                                                     error:&err];
     if (!mImpl->mergePipe) {
-        fprintf(stderr, "[metalflat] pipeline build failed: %s\n",
-                err ? [[err localizedDescription] UTF8String] : "?");
+        MFLAT_LOG_ERROR("pipeline build failed: %s",
+                        err ? [[err localizedDescription] UTF8String] : "?");
         return;
     }
 
     mImpl->gemm = std::make_unique<GemmDistance>(mImpl->device);
     if (!mImpl->gemm->ready()) {
-        fprintf(stderr, "[metalflat] MPS GEMM unavailable — using CPU fallback\n");
+        MFLAT_LOG_INFO("MPS GEMM unavailable — using CPU fallback");
         return;
     }
     mImpl->ready = true;
@@ -329,9 +331,7 @@ SearchResult FlatIndex::search(const float* queries, int m, int k) {
     if (k < 1) k = 1;
     if (k > kMaxK) {
         if (!mImpl->warnedK) {
-            fprintf(stderr,
-                "[metalflat] k=%d clamped to kMaxK=%d (v1 GPU limit)\n",
-                k, kMaxK);
+            MFLAT_LOG_WARN("k=%d clamped to kMaxK=%d (v1 GPU limit)", k, kMaxK);
             mImpl->warnedK = true;
         }
         k = kMaxK;

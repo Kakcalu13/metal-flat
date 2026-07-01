@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // metal-flat/include/metalflat/IvfIndex.h
 //
 // IVF (inverted file) approximate nearest-neighbour index.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // metal-flat/src/GemmDistance.mm — MPS-backed GEMM for flat search.
 
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
