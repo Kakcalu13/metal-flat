@@ -30,6 +30,7 @@
 #include "metalflat/FlatIndex.h"
 #include "GemmDistance.h"
 #include "Log_internal.h"
+#include "Distance.h"   // mflat::detail::{dot,sqL2,rowSqNorms,normalizeRows,score,...}
 
 namespace mflat {
 
@@ -106,28 +107,8 @@ kernel void topk_merge(
 }
 )";
 
-void normalizeRows(std::vector<float>& v, int n, int dim) {
-    for (int i = 0; i < n; ++i) {
-        float* row = &v[static_cast<size_t>(i) * dim];
-        double s = 0.0;
-        for (int c = 0; c < dim; ++c) s += double(row[c]) * row[c];
-        if (s > 0.0) {
-            const float inv = static_cast<float>(1.0 / std::sqrt(s));
-            for (int c = 0; c < dim; ++c) row[c] *= inv;
-        }
-    }
-}
-
-// Squared L2 norm per row → out[i] = ‖row_i‖². Feeds the L2 identity.
-void rowSqNorms(const float* v, int n, int dim, std::vector<float>& out) {
-    out.resize(n);
-    for (int i = 0; i < n; ++i) {
-        const float* row = v + static_cast<size_t>(i) * dim;
-        double s = 0.0;
-        for (int c = 0; c < dim; ++c) s += double(row[c]) * row[c];
-        out[i] = static_cast<float>(s);
-    }
-}
+// normalizeRows / rowSqNorms / dot / sqL2 / score come from Distance.h
+// (mflat::detail) — shared with the IVF sources.
 
 // Acquire a Metal device robustly. MTLCreateSystemDefaultDevice() can
 // return nil in valid session contexts (certain logins / headless-ish
@@ -183,8 +164,8 @@ struct FlatIndex::Impl {
                                         length:dbCpu.size() * sizeof(float)
                                        options:MTLResourceStorageModeShared];
             dbBuf.label = @"mflat_db";
-            std::vector<float> dn;
-            rowSqNorms(dbCpu.data(), dbCount, dim, dn);
+            std::vector<float> dn(dbCount);
+            detail::rowSqNorms(dbCpu.data(), dbCount, dim, dn.data());
             dnormBuf = [device newBufferWithBytes:dn.data()
                                            length:dn.size() * sizeof(float)
                                           options:MTLResourceStorageModeShared];
@@ -257,11 +238,8 @@ void FlatIndex::add(const float* vectors, int n) {
     const size_t base = mImpl->dbCpu.size();
     mImpl->dbCpu.insert(mImpl->dbCpu.end(), vectors,
                         vectors + static_cast<size_t>(n) * mImpl->dim);
-    if (mImpl->metric == Metric::Cosine) {
-        std::vector<float> tmp(mImpl->dbCpu.begin() + base, mImpl->dbCpu.end());
-        normalizeRows(tmp, n, mImpl->dim);
-        std::copy(tmp.begin(), tmp.end(), mImpl->dbCpu.begin() + base);
-    }
+    if (mImpl->metric == Metric::Cosine)
+        detail::normalizeRows(&mImpl->dbCpu[base], n, mImpl->dim);   // in place
     mImpl->dbCount += n;
     mImpl->dirty = true;
 }
@@ -281,10 +259,8 @@ namespace {
 void cpuSearch(const std::vector<float>& db, int dbCount, int dim,
                Metric metric, const float* queries, int m, int k,
                SearchResult& out) {
-    const bool isL2 = (metric == Metric::L2);
     out.ids.assign(static_cast<size_t>(m) * k, -1);
-    out.distances.assign(static_cast<size_t>(m) * k,
-                         isL2 ? INFINITY : -INFINITY);
+    out.distances.assign(static_cast<size_t>(m) * k, detail::emptyValue(metric));
 
     std::vector<float> bestScore(k);
     std::vector<int>   bestId(k);
@@ -292,25 +268,15 @@ void cpuSearch(const std::vector<float>& db, int dbCount, int dim,
         const float* q = queries + static_cast<size_t>(qi) * dim;
         for (int i = 0; i < k; ++i) { bestScore[i] = -INFINITY; bestId[i] = -1; }
         for (int j = 0; j < dbCount; ++j) {
-            const float* d = &db[static_cast<size_t>(j) * dim];
-            float score;
-            if (isL2) {
-                float acc = 0.0f;
-                for (int c = 0; c < dim; ++c) { float e = q[c] - d[c]; acc += e * e; }
-                score = -acc;
-            } else {
-                float acc = 0.0f;
-                for (int c = 0; c < dim; ++c) acc += q[c] * d[c];
-                score = acc;
-            }
-            if (score > bestScore[0]) {
+            const float s = detail::score(metric, q, &db[static_cast<size_t>(j) * dim], dim);
+            if (s > bestScore[0]) {
                 int pos = 0;
-                while (pos + 1 < k && score > bestScore[pos + 1]) {
+                while (pos + 1 < k && s > bestScore[pos + 1]) {
                     bestScore[pos] = bestScore[pos + 1];
                     bestId[pos]    = bestId[pos + 1];
                     ++pos;
                 }
-                bestScore[pos] = score;
+                bestScore[pos] = s;
                 bestId[pos]    = j;
             }
         }
@@ -318,7 +284,7 @@ void cpuSearch(const std::vector<float>& db, int dbCount, int dim,
             int src = k - 1 - i;
             out.ids[static_cast<size_t>(qi) * k + i] = bestId[src];
             out.distances[static_cast<size_t>(qi) * k + i] =
-                isL2 ? -bestScore[src] : bestScore[src];
+                detail::scoreToValue(metric, bestScore[src]);
         }
     }
 }
@@ -344,7 +310,7 @@ SearchResult FlatIndex::search(const float* queries, int m, int k) {
     const float* qPtr = queries;
     if (mImpl->metric == Metric::Cosine) {
         qNorm.assign(queries, queries + static_cast<size_t>(m) * dim);
-        normalizeRows(qNorm, m, dim);
+        detail::normalizeRows(qNorm, m, dim);
         qPtr = qNorm.data();
     }
 
@@ -368,8 +334,8 @@ SearchResult FlatIndex::search(const float* queries, int m, int k) {
 
     // Per-query squared norms for the L2 identity (cheap; computed
     // regardless of metric so the kernel binding stays uniform).
-    std::vector<float> qn;
-    rowSqNorms(qPtr, m, dim, qn);
+    std::vector<float> qn(m);
+    detail::rowSqNorms(qPtr, m, dim, qn.data());
 
     @autoreleasepool {
         id<MTLBuffer> qBuf = [mImpl->device

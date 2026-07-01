@@ -36,6 +36,7 @@
 #include "metalflat/FlatIndex.h"
 #include "Internal.h"
 #include "Log_internal.h"
+#include "CoarseQuantizer.h"
 
 namespace mflat {
 
@@ -188,53 +189,8 @@ kernel void ivf_scan(
 // Shared helpers (normalizeRows, sqL2, parallelFor, accumulateCentroids,
 // kmeansGpu, acquireMetalDevice) now live in Internal.h (mflat::detail).
 
-// Scalar CPU k-means — the no-Metal fallback (IvfIndex-specific; the GPU path
-// uses detail::kmeansGpu).
-void kmeans(const float* data, int n, int dim, int nlist, int iters,
-            std::vector<float>& centroids) {
-    centroids.assign(static_cast<size_t>(nlist) * dim, 0.0f);
-    std::mt19937 rng(12345);
-    std::vector<int> perm(n);
-    for (int i = 0; i < n; ++i) perm[i] = i;
-    std::shuffle(perm.begin(), perm.end(), rng);
-    for (int c = 0; c < nlist; ++c)
-        std::copy_n(data + static_cast<size_t>(perm[c]) * dim, dim,
-                    centroids.begin() + static_cast<size_t>(c) * dim);
-
-    std::vector<int> assign(n, 0);
-    for (int it = 0; it < iters; ++it) {
-        parallelFor(n, [&](int i) {
-            const float* v = data + static_cast<size_t>(i) * dim;
-            float best = std::numeric_limits<float>::infinity();
-            int   bestC = 0;
-            for (int c = 0; c < nlist; ++c) {
-                float dd = sqL2(v, &centroids[static_cast<size_t>(c) * dim], dim);
-                if (dd < best) { best = dd; bestC = c; }
-            }
-            assign[i] = bestC;
-        });
-        std::vector<double> sums(static_cast<size_t>(nlist) * dim, 0.0);
-        std::vector<int>    counts(nlist, 0);
-        for (int i = 0; i < n; ++i) {
-            const float* v = data + static_cast<size_t>(i) * dim;
-            const int    c = assign[i];
-            double* s = &sums[static_cast<size_t>(c) * dim];
-            for (int d = 0; d < dim; ++d) s[d] += v[d];
-            ++counts[c];
-        }
-        for (int c = 0; c < nlist; ++c) {
-            float* ce = &centroids[static_cast<size_t>(c) * dim];
-            if (counts[c] > 0) {
-                const double* s = &sums[static_cast<size_t>(c) * dim];
-                for (int d = 0; d < dim; ++d)
-                    ce[d] = static_cast<float>(s[d] / counts[c]);
-            } else {
-                const int r = static_cast<int>(rng() % static_cast<unsigned>(n));
-                std::copy_n(data + static_cast<size_t>(r) * dim, dim, ce);
-            }
-        }
-    }
-}
+// Scalar CPU k-means (no-Metal fallback) + all coarse-layer logic now live in
+// CoarseQuantizer (src/CoarseQuantizer.{h,mm}).
 
 }  // namespace
 
@@ -245,21 +201,15 @@ struct IvfIndex::Impl {
     int    dbCount = 0;
     bool   ready   = false;
 
-    // CPU-authoritative training output + CSR inverted lists.
-    std::vector<float> centroids;     // nlist × dim
-    std::vector<int>   cellStart;     // nlist + 1
-    std::vector<float> reorderedDb;   // dbCount × dim
-    std::vector<int>   reorderedIds;  // dbCount
+    // Coarse layer: centroids, CSR, coarse FlatIndex, cell/id GPU buffers.
+    std::unique_ptr<CoarseQuantizer> cq;
+    std::vector<float> reorderedDb;   // dbCount × dim (float payload; CPU reference)
 
-    // GPU path.
-    id<MTLDevice>               device  = nil;
-    id<MTLCommandQueue>         queue   = nil;
+    // GPU fine-scan path.
+    id<MTLDevice>               device   = nil;
+    id<MTLCommandQueue>         queue    = nil;
     id<MTLComputePipelineState> scanPipe = nil;
-    std::unique_ptr<FlatIndex>  coarse;          // exact search over centroids
     id<MTLBuffer>               dbBuf    = nil;   // reorderedDb as fp16 (half)
-    id<MTLBuffer>               idBuf    = nil;   // reorderedIds
-    id<MTLBuffer>               cellBuf  = nil;   // cellStart
-    bool                        gpuReady = false;
 };
 
 IvfIndex::IvfIndex(int dim, Metric metric, int nlist)
@@ -269,25 +219,27 @@ IvfIndex::IvfIndex(int dim, Metric metric, int nlist)
     mImpl->nlist  = nlist;
 
     mImpl->device = acquireMetalDevice();
-    if (!mImpl->device) return;   // CPU-only path stays available
-    mImpl->queue = [mImpl->device newCommandQueue];
-
-    NSError* err = nil;
-    id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kShaderSrc
-                                                     options:nil
-                                                       error:&err];
-    if (!lib) {
-        MFLAT_LOG_ERROR("ivf shader compile failed: %s",
-                        err ? [[err localizedDescription] UTF8String] : "?");
-        return;
+    if (mImpl->device) {
+        mImpl->queue = [mImpl->device newCommandQueue];
+        NSError* err = nil;
+        id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kShaderSrc
+                                                         options:nil
+                                                           error:&err];
+        if (!lib) {
+            MFLAT_LOG_ERROR("ivf shader compile failed: %s",
+                            err ? [[err localizedDescription] UTF8String] : "?");
+        } else {
+            id<MTLFunction> fn = [lib newFunctionWithName:@"ivf_scan"];
+            mImpl->scanPipe = [mImpl->device newComputePipelineStateWithFunction:fn
+                                                                           error:&err];
+            if (!mImpl->scanPipe)
+                MFLAT_LOG_ERROR("ivf pipeline build failed: %s",
+                                err ? [[err localizedDescription] UTF8String] : "?");
+        }
     }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"ivf_scan"];
-    mImpl->scanPipe = [mImpl->device newComputePipelineStateWithFunction:fn
-                                                                   error:&err];
-    if (!mImpl->scanPipe) {
-        MFLAT_LOG_ERROR("ivf pipeline build failed: %s",
-                        err ? [[err localizedDescription] UTF8String] : "?");
-    }
+    // The coarse quantizer uses the device only when the fine-scan pipeline is
+    // usable (preserves the old scanPipe-gated GPU behavior); nil => CPU coarse.
+    mImpl->cq = std::make_unique<CoarseQuantizer>(mImpl->scanPipe ? mImpl->device : nil, dim);
 }
 
 IvfIndex::~IvfIndex() = default;
@@ -304,59 +256,20 @@ void IvfIndex::build(const float* vectors, int n) {
     std::vector<float> data(vectors, vectors + static_cast<size_t>(n) * dim);
     if (mImpl->metric == Metric::Cosine) normalizeRows(data, n, dim);
 
-    const int nlist = std::min(mImpl->nlist, n);
-    mImpl->nlist = nlist;
-
-    constexpr int kIters = 12;
-    std::vector<int> assign;
-    if (mImpl->scanPipe) {
-        // GPU k-means: the assignment step runs on the MPS GEMM path via a
-        // reused FlatIndex; assign[] comes back consistent with the final
-        // centroids, so no separate CPU assignment pass is needed.
-        kmeansGpu(data.data(), n, dim, nlist, kIters, mImpl->centroids, assign);
-    } else {
-        // No Metal device: scalar CPU k-means + one assignment pass.
-        kmeans(data.data(), n, dim, nlist, kIters, mImpl->centroids);
-        assign.assign(n, 0);
-        parallelFor(n, [&](int i) {
-            const float* v = &data[static_cast<size_t>(i) * dim];
-            float best = std::numeric_limits<float>::infinity();
-            int   bestC = 0;
-            for (int c = 0; c < nlist; ++c) {
-                float dd = sqL2(v, &mImpl->centroids[static_cast<size_t>(c) * dim], dim);
-                if (dd < best) { best = dd; bestC = c; }
-            }
-            assign[i] = bestC;
-        });
-    }
-
-    mImpl->cellStart.assign(nlist + 1, 0);
-    for (int i = 0; i < n; ++i) ++mImpl->cellStart[assign[i] + 1];
-    for (int c = 0; c < nlist; ++c)
-        mImpl->cellStart[c + 1] += mImpl->cellStart[c];
-
-    mImpl->reorderedDb.assign(static_cast<size_t>(n) * dim, 0.0f);
-    mImpl->reorderedIds.assign(n, 0);
-    std::vector<int> cursor(mImpl->cellStart.begin(), mImpl->cellStart.end());
-    for (int i = 0; i < n; ++i) {
-        const int c   = assign[i];
-        const int pos = cursor[c]++;
-        std::copy_n(&data[static_cast<size_t>(i) * dim], dim,
-                    &mImpl->reorderedDb[static_cast<size_t>(pos) * dim]);
-        mImpl->reorderedIds[pos] = i;
-    }
-
+    // Coarse quantizer: k-means + CSR + coarse FlatIndex + cell/id GPU buffers.
+    mImpl->cq->train(data.data(), n, mImpl->nlist, 12,
+                     CoarseQuantizer::KmeansBackend::Auto);
+    mImpl->nlist   = mImpl->cq->nlist();
     mImpl->dbCount = n;
-    mImpl->ready   = true;
 
-    // --- GPU path setup: coarse quantizer + upload CSR ---------------
-    if (mImpl->scanPipe) {
-        mImpl->coarse = std::make_unique<FlatIndex>(dim, Metric::L2);
-        mImpl->coarse->add(mImpl->centroids.data(), nlist);
+    // Reorder the float payload into CSR slot order; then (GPU) cast to fp16 for
+    // the scan buffer. reorder-before-cast keeps the fp16 db lossless-identical.
+    mImpl->reorderedDb.assign(static_cast<size_t>(n) * dim, 0.0f);
+    mImpl->cq->reorderPayload(data.data(), mImpl->reorderedDb.data(),
+                              static_cast<size_t>(dim) * sizeof(float));
+    mImpl->ready = true;
 
-        // Upload the database as fp16 (halves the scan's memory traffic; the
-        // CPU keeps the fp32 copy for the reference path). Lossless for inputs
-        // exactly representable in half (e.g. SIFT's small integers).
+    if (mImpl->scanPipe && mImpl->cq->gpuReady()) {
         std::vector<__fp16> dbHalf(mImpl->reorderedDb.size());
         for (size_t i = 0; i < dbHalf.size(); ++i)
             dbHalf[i] = static_cast<__fp16>(mImpl->reorderedDb[i]);
@@ -364,15 +277,6 @@ void IvfIndex::build(const float* vectors, int n) {
             newBufferWithBytes:dbHalf.data()
                         length:dbHalf.size() * sizeof(__fp16)
                        options:MTLResourceStorageModeShared];
-        mImpl->idBuf = [mImpl->device
-            newBufferWithBytes:mImpl->reorderedIds.data()
-                        length:mImpl->reorderedIds.size() * sizeof(int32_t)
-                       options:MTLResourceStorageModeShared];
-        mImpl->cellBuf = [mImpl->device
-            newBufferWithBytes:mImpl->cellStart.data()
-                        length:mImpl->cellStart.size() * sizeof(int32_t)
-                       options:MTLResourceStorageModeShared];
-        mImpl->gpuReady = mImpl->coarse->ready();
     }
 }
 
@@ -381,46 +285,33 @@ namespace {
 // CPU two-stage search — the fallback (and the numerically-clean
 // reference for the GPU path). Takes raw fields, not Impl, so it stays a
 // free function without reaching into IvfIndex's private nested type.
-void searchCpu(const std::vector<float>& centroids,
-               const std::vector<int>&   cellStart,
-               const std::vector<float>& reorderedDb,
-               const std::vector<int>&   reorderedIds,
-               int dim, int nlist, Metric metric,
-               const float* qPtr, int m, int k, int nprobe,
+void searchCpu(const CoarseQuantizer& cq, const std::vector<float>& reorderedDb,
+               int dim, Metric metric, const float* qPtr, int m, int k, int nprobe,
                SearchResult& out) {
-    const bool isL2 = (metric == Metric::L2);
-
+    const std::vector<int>& cellStart    = cq.cellStart();
+    const std::vector<int>& reorderedIds = cq.reorderedIds();
     parallelFor(m, [&](int qi) {
         const float* q = qPtr + static_cast<size_t>(qi) * dim;
-        std::vector<std::pair<float, int>> cd(nlist);
-        for (int c = 0; c < nlist; ++c)
-            cd[c] = {sqL2(q, &centroids[static_cast<size_t>(c) * dim], dim), c};
-        std::partial_sort(cd.begin(), cd.begin() + nprobe, cd.end());
+        std::vector<int> cells(nprobe);
+        cq.probeCellsCpu(q, nprobe, cells.data());
 
         std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
         std::vector<int>   bestId(k, -1);
         for (int pp = 0; pp < nprobe; ++pp) {
-            const int c  = cd[pp].second;
+            const int c  = cells[pp];
             const int lo = cellStart[c];
             const int hi = cellStart[c + 1];
             for (int j = lo; j < hi; ++j) {
-                const float* d = &reorderedDb[static_cast<size_t>(j) * dim];
-                float score;
-                if (isL2) {
-                    score = -sqL2(q, d, dim);
-                } else {
-                    float acc = 0.0f;
-                    for (int cc = 0; cc < dim; ++cc) acc += q[cc] * d[cc];
-                    score = acc;
-                }
-                if (score > bestScore[0]) {
+                const float s = detail::score(metric, q,
+                        &reorderedDb[static_cast<size_t>(j) * dim], dim);
+                if (s > bestScore[0]) {
                     int pos = 0;
-                    while (pos + 1 < k && score > bestScore[pos + 1]) {
+                    while (pos + 1 < k && s > bestScore[pos + 1]) {
                         bestScore[pos] = bestScore[pos + 1];
                         bestId[pos]    = bestId[pos + 1];
                         ++pos;
                     }
-                    bestScore[pos] = score;
+                    bestScore[pos] = s;
                     bestId[pos]    = reorderedIds[j];
                 }
             }
@@ -429,7 +320,7 @@ void searchCpu(const std::vector<float>& centroids,
             const int src = k - 1 - i;
             const size_t o = static_cast<size_t>(qi) * k + i;
             out.ids[o]       = bestId[src];
-            out.distances[o] = isL2 ? -bestScore[src] : bestScore[src];
+            out.distances[o] = detail::scoreToValue(metric, bestScore[src]);
         }
     });
 }
@@ -447,14 +338,11 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
     if (nprobe < 1) nprobe = 1;
     if (nprobe > nlist) nprobe = nlist;
 
-    const bool isL2 = (mImpl->metric == Metric::L2);
     out.ids.assign(static_cast<size_t>(m) * k, -1);
-    out.distances.assign(static_cast<size_t>(m) * k,
-                         isL2 ? std::numeric_limits<float>::infinity()
-                              : -std::numeric_limits<float>::infinity());
+    out.distances.assign(static_cast<size_t>(m) * k, detail::emptyValue(mImpl->metric));
 
-    // Cosine: normalize queries once; used by both stages (the coarse
-    // quantizer's centroids and the cells are built from normalized data).
+    // Cosine: normalize queries once (coarse centroids + cells were built from
+    // normalized data).
     std::vector<float> qNorm;
     const float* qPtr = queries;
     if (mImpl->metric == Metric::Cosine) {
@@ -463,41 +351,19 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
         qPtr = qNorm.data();
     }
 
-    // The GPU fine scan runs for ANY nprobe. Only the coarse cell-selection is
-    // bounded by FlatIndex::kMaxK (its GPU top-k), so: for nprobe<=kMaxK use the
-    // GPU coarse quantizer; for larger nprobe select the nprobe nearest
-    // centroids on the CPU (partial_sort over the small nlist) and feed the same
-    // nprobe-agnostic ivf_scan kernel. No more CPU-only cliff (and recall cap)
-    // at nprobe=64.
-    const bool gpuPath = mImpl->gpuReady && mImpl->coarse && k <= kMaxK;
+    // GPU path needs the fine-scan pipeline AND the GPU coarse quantizer; k>kMaxK
+    // falls to the exact CPU path (the GPU top-k uses fixed kMaxK-sized buffers).
+    const bool gpuPath = mImpl->scanPipe && mImpl->cq->gpuReady() && k <= kMaxK;
     if (!gpuPath) {
-        searchCpu(mImpl->centroids, mImpl->cellStart, mImpl->reorderedDb,
-                  mImpl->reorderedIds, dim, nlist, mImpl->metric,
+        searchCpu(*mImpl->cq, mImpl->reorderedDb, dim, mImpl->metric,
                   qPtr, m, k, nprobe, out);
         return out;
     }
 
-    // Build the m × nprobe probed-cell list (cell indices), GPU or CPU coarse.
-    SearchResult coarse;             // owns storage for the GPU coarse path
-    std::vector<int32_t> probedCpu;  // owns storage for the CPU coarse path
-    const int32_t* probedPtr = nullptr;
-    if (nprobe <= FlatIndex::kMaxK) {
-        coarse = mImpl->coarse->search(qPtr, m, nprobe);  // exact, on GPU
-        probedPtr = coarse.ids.data();
-    } else {
-        probedCpu.assign(static_cast<size_t>(m) * nprobe, -1);
-        const std::vector<float>& cents = mImpl->centroids;
-        parallelFor(m, [&](int qi) {
-            const float* q = qPtr + static_cast<size_t>(qi) * dim;
-            std::vector<std::pair<float, int>> cd(nlist);
-            for (int c = 0; c < nlist; ++c)
-                cd[c] = {sqL2(q, &cents[static_cast<size_t>(c) * dim], dim), c};
-            std::partial_sort(cd.begin(), cd.begin() + nprobe, cd.end());
-            int32_t* row = &probedCpu[static_cast<size_t>(qi) * nprobe];
-            for (int p = 0; p < nprobe; ++p) row[p] = cd[p].second;
-        });
-        probedPtr = probedCpu.data();
-    }
+    // Coarse: the m × nprobe nearest cells per query (GPU FlatIndex or CPU).
+    std::vector<int32_t> probed;
+    mImpl->cq->probeCells(qPtr, m, nprobe, probed);
+    const int32_t* probedPtr = probed.data();
 
     @autoreleasepool {
         id<MTLBuffer> qBuf = [mImpl->device
@@ -526,8 +392,8 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:mImpl->scanPipe];
         [enc setBuffer:mImpl->dbBuf   offset:0 atIndex:0];
-        [enc setBuffer:mImpl->idBuf   offset:0 atIndex:1];
-        [enc setBuffer:mImpl->cellBuf offset:0 atIndex:2];
+        [enc setBuffer:mImpl->cq->idBuffer()   offset:0 atIndex:1];
+        [enc setBuffer:mImpl->cq->cellBuffer() offset:0 atIndex:2];
         [enc setBuffer:qBuf           offset:0 atIndex:3];
         [enc setBuffer:probedBuf      offset:0 atIndex:4];
         [enc setBuffer:outIdBuf       offset:0 atIndex:5];
