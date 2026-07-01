@@ -36,8 +36,13 @@
 
 #include "metalflat/IvfPqIndex.h"
 #include "metalflat/FlatIndex.h"
+#include "Internal.h"
+#include "Log_internal.h"
 
 namespace mflat {
+
+using namespace detail;   // parallelFor, normalizeRows, kmeansGpu, ...
+
 namespace {
 
 constexpr int kKsub = 256;   // centroids per sub-quantizer (8-bit codes)
@@ -166,116 +171,8 @@ kernel void ivfpq_adc(
 }
 )";
 
-// ---- shared helpers (self-contained copies; same logic as IvfIndex) -------
-
-void normalizeRows(std::vector<float>& v, int n, int dim) {
-    for (int i = 0; i < n; ++i) {
-        float* row = &v[static_cast<size_t>(i) * dim];
-        double s = 0.0;
-        for (int c = 0; c < dim; ++c) s += double(row[c]) * row[c];
-        if (s > 0.0) {
-            const float inv = static_cast<float>(1.0 / std::sqrt(s));
-            for (int c = 0; c < dim; ++c) row[c] *= inv;
-        }
-    }
-}
-
-template <typename Fn>
-void parallelFor(int n, Fn fn) {
-    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
-    if (n <= 1 || nt == 1) { for (int i = 0; i < n; ++i) fn(i); return; }
-    std::vector<std::thread> pool;
-    const int chunk = (n + static_cast<int>(nt) - 1) / static_cast<int>(nt);
-    for (unsigned t = 0; t < nt; ++t) {
-        const int lo = static_cast<int>(t) * chunk;
-        const int hi = std::min(n, lo + chunk);
-        if (lo < hi) pool.emplace_back([lo, hi, &fn] { for (int i = lo; i < hi; ++i) fn(i); });
-    }
-    for (auto& th : pool) th.join();
-}
-
-void accumulateCentroids(const float* data, int n, int dim, int nlist,
-                         const std::vector<int>& assign,
-                         std::vector<float>& centroids, std::mt19937& rng) {
-    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
-    std::vector<std::vector<double>> tsums(
-        nt, std::vector<double>(static_cast<size_t>(nlist) * dim, 0.0));
-    std::vector<std::vector<int>> tcnt(nt, std::vector<int>(nlist, 0));
-    const int chunk = (n + static_cast<int>(nt) - 1) / static_cast<int>(nt);
-    std::vector<std::thread> pool;
-    for (unsigned t = 0; t < nt; ++t) {
-        const int lo = static_cast<int>(t) * chunk, hi = std::min(n, lo + chunk);
-        if (lo >= hi) continue;
-        pool.emplace_back([&, t, lo, hi] {
-            auto& s = tsums[t]; auto& cnt = tcnt[t];
-            for (int i = lo; i < hi; ++i) {
-                const float* v = data + static_cast<size_t>(i) * dim;
-                const int c = assign[i];
-                double* sc = &s[static_cast<size_t>(c) * dim];
-                for (int d = 0; d < dim; ++d) sc[d] += v[d];
-                ++cnt[c];
-            }
-        });
-    }
-    for (auto& th : pool) th.join();
-    parallelFor(nlist, [&](int c) {
-        long cnt = 0;
-        for (unsigned t = 0; t < nt; ++t) cnt += tcnt[t][c];
-        float* ce = &centroids[static_cast<size_t>(c) * dim];
-        if (cnt > 0) {
-            for (int d = 0; d < dim; ++d) {
-                double acc = 0.0;
-                for (unsigned t = 0; t < nt; ++t)
-                    acc += tsums[t][static_cast<size_t>(c) * dim + d];
-                ce[d] = static_cast<float>(acc / static_cast<double>(cnt));
-            }
-        }
-    });
-    for (int c = 0; c < nlist; ++c) {
-        long cnt = 0;
-        for (unsigned t = 0; t < nt; ++t) cnt += tcnt[t][c];
-        if (cnt == 0) {
-            const int r = static_cast<int>(rng() % static_cast<unsigned>(n));
-            std::copy_n(data + static_cast<size_t>(r) * dim, dim,
-                        &centroids[static_cast<size_t>(c) * dim]);
-        }
-    }
-}
-
-// k-means whose assignment runs through FlatIndex (GPU GEMM, or exact CPU
-// fallback when no device). `assignOut` is consistent with the final centroids.
-void kmeansFI(const float* data, int n, int dim, int nlist, int iters,
-              std::vector<float>& centroids, std::vector<int>& assignOut) {
-    centroids.assign(static_cast<size_t>(nlist) * dim, 0.0f);
-    std::mt19937 rng(12345);
-    std::vector<int> perm(n);
-    for (int i = 0; i < n; ++i) perm[i] = i;
-    std::shuffle(perm.begin(), perm.end(), rng);
-    for (int c = 0; c < nlist; ++c)
-        std::copy_n(data + static_cast<size_t>(perm[c]) * dim, dim,
-                    centroids.begin() + static_cast<size_t>(c) * dim);
-
-    FlatIndex assigner(dim, Metric::L2);
-    assignOut.assign(n, 0);
-    auto assignNow = [&] {
-        assigner.reset();
-        assigner.add(centroids.data(), nlist);
-        SearchResult r = assigner.search(data, n, 1);
-        for (int i = 0; i < n; ++i) assignOut[i] = r.ids[static_cast<size_t>(i)];
-    };
-    for (int it = 0; it < iters; ++it) {
-        assignNow();
-        accumulateCentroids(data, n, dim, nlist, assignOut, centroids, rng);
-    }
-    assignNow();
-}
-
-id<MTLDevice> acquireMetalDevice() {
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (dev) return dev;
-    NSArray<id<MTLDevice>>* all = MTLCopyAllDevices();
-    return all.count > 0 ? all[0] : nil;
-}
+// Shared helpers (normalizeRows, parallelFor, accumulateCentroids, kmeansGpu,
+// acquireMetalDevice) live in Internal.h (mflat::detail).
 
 }  // namespace
 
@@ -323,7 +220,7 @@ IvfPqIndex::IvfPqIndex(int dim, Metric metric, int nlist, int m)
     mImpl->dsub   = (m > 0) ? dim / m : 0;
 
     if (m <= 0 || dim <= 0 || dim % m != 0) {
-        fprintf(stderr, "[metalflat] IvfPqIndex: m (%d) must divide dim (%d)\n", m, dim);
+        MFLAT_LOG_ERROR("IvfPqIndex: m (%d) must divide dim (%d)", m, dim);
         return;
     }
     mImpl->device = acquireMetalDevice();
@@ -333,15 +230,15 @@ IvfPqIndex::IvfPqIndex(int dim, Metric metric, int nlist, int m)
     NSError* err = nil;
     id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kShaderSrc options:nil error:&err];
     if (!lib) {
-        fprintf(stderr, "[metalflat] ivfpq shader compile failed: %s\n",
-                err ? [[err localizedDescription] UTF8String] : "?");
+        MFLAT_LOG_ERROR("ivfpq shader compile failed: %s",
+                        err ? [[err localizedDescription] UTF8String] : "?");
         return;
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"ivfpq_adc"];
     mImpl->adcPipe = [mImpl->device newComputePipelineStateWithFunction:fn error:&err];
     if (!mImpl->adcPipe)
-        fprintf(stderr, "[metalflat] ivfpq pipeline build failed: %s\n",
-                err ? [[err localizedDescription] UTF8String] : "?");
+        MFLAT_LOG_ERROR("ivfpq pipeline build failed: %s",
+                        err ? [[err localizedDescription] UTF8String] : "?");
 }
 
 IvfPqIndex::~IvfPqIndex() = default;
@@ -367,7 +264,7 @@ void IvfPqIndex::build(const float* vectors, int n) {
 
     // 1. coarse quantizer.
     std::vector<int> assign;
-    kmeansFI(data.data(), n, dim, nlist, kIters, mImpl->centroids, assign);
+    kmeansGpu(data.data(), n, dim, nlist, kIters, mImpl->centroids, assign);
 
     // 2. PQ training (non-residual) + 3. encode, one sub-space at a time.
     mImpl->pqCentroids.assign(static_cast<size_t>(M) * kKsub * dsub, 0.0f);
@@ -381,7 +278,7 @@ void IvfPqIndex::build(const float* vectors, int n) {
         });
         std::vector<float> subCent;
         std::vector<int>   subAssign;
-        kmeansFI(sub.data(), n, dsub, kKsub, kIters, subCent, subAssign);
+        kmeansGpu(sub.data(), n, dsub, kKsub, kIters, subCent, subAssign);
         std::copy(subCent.begin(), subCent.end(),
                   &mImpl->pqCentroids[static_cast<size_t>(mm) * kKsub * dsub]);
         for (int j = 0; j < kKsub; ++j) {
