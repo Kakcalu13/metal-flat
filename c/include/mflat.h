@@ -52,6 +52,27 @@ MFLAT_API const char* mflat_version(void);             /* "0.1.0"             */
 MFLAT_API const char* mflat_status_str(mflat_status_t);/* static; do not free */
 MFLAT_API int         mflat_max_k(void);               /* MFLAT_MAX_K         */
 
+/* ---------------- Logging -------------------------------------------- */
+/* By default the library writes diagnostics to stderr ("[metalflat] ..."). */
+/* Consumers can redirect or silence that. Process-global (like mflat_version). */
+typedef enum {                    /* value-stable; mirrors mflat::LogLevel */
+    MFLAT_LOG_INFO  = 0,
+    MFLAT_LOG_WARN  = 1,
+    MFLAT_LOG_ERROR = 2,
+    MFLAT_LOG_OFF   = 3            /* threshold only; never delivered to a handler */
+} mflat_log_level_t;
+
+/* msg: NUL-terminated UTF-8, no "[metalflat]" prefix and no newline. user is
+   round-tripped untouched. Called synchronously on the logging thread. */
+typedef void (*mflat_log_handler_t)(mflat_log_level_t level, const char* msg, void* user);
+
+/* handler == NULL RESTORES the built-in stderr sink; use
+   mflat_set_log_level(MFLAT_LOG_OFF) to silence. Configure once before
+   concurrent searches; a custom handler must be thread-safe and must not throw. */
+MFLAT_API void              mflat_set_log_handler(mflat_log_handler_t handler, void* user);
+MFLAT_API void              mflat_set_log_level(mflat_log_level_t threshold);
+MFLAT_API mflat_log_level_t mflat_log_level(void);
+
 /* ---------------- FlatIndex (exact) ----------------------------------- */
 typedef struct mflat_flat_index mflat_flat_index_t;    /* opaque */
 

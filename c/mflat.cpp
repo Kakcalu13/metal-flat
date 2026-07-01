@@ -11,6 +11,7 @@
 
 #include "mflat.h"
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -18,6 +19,7 @@
 #include "metalflat/FlatIndex.h"
 #include "metalflat/IvfIndex.h"
 #include "metalflat/IvfPqIndex.h"
+#include "metalflat/Log.h"
 
 using mflat::FlatIndex;
 using mflat::IvfIndex;
@@ -47,6 +49,15 @@ mflat_status_t emit(const SearchResult& r, int m,
     return MFLAT_OK;
 }
 
+// Log trampoline: the C handler type (C enum) differs from mflat::LogHandler
+// (enum class), so we trampoline through this — never cast the function pointer.
+std::atomic<mflat_log_handler_t> gCHandler{nullptr};
+std::atomic<void*>               gCUser{nullptr};
+void cLogTrampoline(mflat::LogLevel lvl, const char* msg, void*) {
+    if (auto h = gCHandler.load(std::memory_order_acquire))
+        h(static_cast<mflat_log_level_t>(lvl), msg, gCUser.load(std::memory_order_acquire));
+}
+
 }  // namespace
 
 struct mflat_flat_index  { FlatIndex   idx; std::mutex mu;
@@ -60,6 +71,18 @@ extern "C" {
 
 const char* mflat_version(void) { return "0.1.0"; }
 int         mflat_max_k(void)   { return MFLAT_MAX_K; }
+
+void mflat_set_log_handler(mflat_log_handler_t h, void* user) {
+    gCUser.store(user, std::memory_order_release);
+    gCHandler.store(h, std::memory_order_release);
+    mflat::setLogHandler(h ? &cLogTrampoline : nullptr, nullptr);  // NULL => C++ default sink
+}
+void mflat_set_log_level(mflat_log_level_t l) {
+    mflat::setLogLevel(static_cast<mflat::LogLevel>(l));
+}
+mflat_log_level_t mflat_log_level(void) {
+    return static_cast<mflat_log_level_t>(mflat::logLevel());
+}
 const char* mflat_status_str(mflat_status_t s) {
     switch (s) {
         case MFLAT_OK:            return "ok";
