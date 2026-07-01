@@ -18,6 +18,7 @@ add_library(metalflat STATIC
     src/IvfIndex.mm
     src/IvfPqIndex.mm
     src/CoarseQuantizer.mm
+    src/GraphIndex.mm
     src/Log.cpp)
 target_include_directories(metalflat PUBLIC include)
 target_include_directories(metalflat PRIVATE src)
