@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // metalflat/GraphIndex.h — CAGRA-style graph ANN index for Apple Silicon.
 //
-// Builds a fixed-degree (R) approximate k-NN graph over the database (reusing
-// the GPU IVF index as the batched-kNN primitive), then answers queries by
-// best-first graph traversal. Targets the high-recall / low-latency regime that
-// graph indexes (HNSW) own. v1: GPU build + a reference best-first search; the
-// GPU beam-search kernel is layered on next.
+// Builds a fixed-degree (R) graph — reuse the GPU IVF for an intermediate k-NN,
+// RNG/detour-prune it (NSG/DiskANN-style, for greedy navigability), add reverse
+// edges — then answers queries with a fixed-iteration beam search on the GPU
+// (one threadgroup/query; per-query visited hash; search-width W; early-break).
+// A CPU best-first search is the reference/fallback. Targets and takes the
+// high-recall / low-latency regime that graph indexes (HNSW) own.
 //
 // Pure C++17 public surface (Metal hidden behind the pimpl), like the others.
 #pragma once
