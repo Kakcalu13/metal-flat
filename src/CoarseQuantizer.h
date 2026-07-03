@@ -57,6 +57,9 @@ public:
 
     // Fill `probed` (resized to m*nprobe, nearest-first cell ids). Uses the GPU
     // coarse FlatIndex when nprobe<=FlatIndex::kMaxK, else CPU partial_sort.
+    // NOTE: only cell IDS are exposed — the coarse FlatIndex's distances are
+    // fp16-derived, so residual-ADC coarse terms must be recomputed exactly
+    // (fp32 sqL2 against centroids()) by the caller.
     void probeCells(const float* queries, int m, int nprobe,
                     std::vector<int32_t>& probed) const;
     // Per-query CPU cell selection (writes nprobe cell ids) for reference paths.
