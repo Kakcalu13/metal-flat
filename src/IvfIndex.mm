@@ -411,12 +411,27 @@ struct IvfIndex::Impl {
     id<MTLComputePipelineState> mergePipe = nil;   // query-tiled phase 2
     id<MTLBuffer>               dbBuf     = nil;   // reorderedDb as fp16 (half)
 
-    // Query-tiled fine scan (see ivf_scan_tiled): invert probed to cell->query
-    // lists on the CPU, run phase 1 (partial top-k per (query,probe)) + phase 2
-    // (per-query merge) in one command buffer. Caller guarantees gpu-ready,
-    // k <= kMaxK, dim % 4 == 0.
-    void runTiledGpu(const float* qPtr, const std::vector<int32_t>& probed,
-                     int m, int k, int nprobe, SearchResult& out);
+    // A committed-but-not-awaited GPU fine scan over the FIRST `rows` queries.
+    // The command buffer retains its resources until completion, so callers
+    // may run CPU work (the hybrid split's CPU slice) between dispatch and
+    // waitUntilCompleted, then copy rows*k results from outId/outVal.
+    struct PendingGpu {
+        id<MTLCommandBuffer> cb    = nil;
+        id<MTLBuffer>        outId = nil;
+        id<MTLBuffer>        outVal = nil;
+        int                  rows  = 0;
+    };
+
+    // Legacy per-query kernel over queries [0, mG). Encode + commit, no wait.
+    PendingGpu dispatchScan(const float* qPtr, const int32_t* probedPtr,
+                            int mG, int k, int nprobe);
+
+    // Query-tiled fine scan (see ivf_scan_tiled) over queries [0, mG): invert
+    // probed to cell->query lists on the CPU, encode phase 1 (partial top-k
+    // per (query,probe)) + phase 2 (per-query merge) in one command buffer,
+    // commit, no wait. Caller guarantees gpu-ready, k <= kMaxK, dim % 4 == 0.
+    PendingGpu dispatchTiled(const float* qPtr, const std::vector<int32_t>& probed,
+                             int mG, int k, int nprobe);
 };
 
 IvfIndex::IvfIndex(int dim, Metric metric, int nlist)
@@ -501,20 +516,29 @@ namespace {
 // CPU two-stage search — the fallback (and the numerically-clean
 // reference for the GPU path). Takes raw fields, not Impl, so it stays a
 // free function without reaching into IvfIndex's private nested type.
+// Processes queries [qOffset, qOffset+m) so the hybrid CPU+GPU split can hand
+// it the batch tail; `probedRows`, when non-null, supplies the (full-batch)
+// coarse cells so the CPU slice probes the SAME cells the GPU slice does.
 void searchCpu(const CoarseQuantizer& cq, const std::vector<float>& reorderedDb,
                int dim, Metric metric, const float* qPtr, int m, int k, int nprobe,
-               SearchResult& out) {
+               SearchResult& out, int qOffset = 0, const int32_t* probedRows = nullptr) {
     const std::vector<int>& cellStart    = cq.cellStart();
     const std::vector<int>& reorderedIds = cq.reorderedIds();
-    parallelFor(m, [&](int qi) {
+    parallelFor(m, [&](int i) {
+        const int qi = qOffset + i;
         const float* q = qPtr + static_cast<size_t>(qi) * dim;
         std::vector<int> cells(nprobe);
-        cq.probeCellsCpu(q, nprobe, cells.data());
+        if (probedRows)
+            for (int p = 0; p < nprobe; ++p)
+                cells[p] = probedRows[static_cast<size_t>(qi) * nprobe + p];
+        else
+            cq.probeCellsCpu(q, nprobe, cells.data());
 
         std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
         std::vector<int>   bestId(k, -1);
         for (int pp = 0; pp < nprobe; ++pp) {
             const int c  = cells[pp];
+            if (c < 0) continue;
             const int lo = cellStart[c];
             const int hi = cellStart[c + 1];
             for (int j = lo; j < hi; ++j) {
@@ -543,8 +567,9 @@ void searchCpu(const CoarseQuantizer& cq, const std::vector<float>& reorderedDb,
 
 }  // namespace
 
-void IvfIndex::Impl::runTiledGpu(const float* qPtr, const std::vector<int32_t>& probed,
-                                 int m, int k, int nprobe, SearchResult& out) {
+IvfIndex::Impl::PendingGpu
+IvfIndex::Impl::dispatchTiled(const float* qPtr, const std::vector<int32_t>& probed,
+                              int m, int k, int nprobe) {
     // --- CPU inversion: probed (m × nprobe, query-major) -> per-cell query
     // lists (CSR qStart + entries), then fixed-size Tq work items. Stable
     // qi-major fill keeps each cell's list deterministic.
@@ -642,12 +667,78 @@ void IvfIndex::Impl::runTiledGpu(const float* qPtr, const std::vector<int32_t>& 
               threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
         [enc endEncoding];
         [cb commit];
-        [cb waitUntilCompleted];
 
-        std::memcpy(out.ids.data(), [outIdBuf contents],
-                    out.ids.size() * sizeof(int32_t));
-        std::memcpy(out.distances.data(), [outValBuf contents],
-                    out.distances.size() * sizeof(float));
+        PendingGpu pend;
+        pend.cb = cb; pend.outId = outIdBuf; pend.outVal = outValBuf; pend.rows = m;
+        return pend;
+    }
+}
+
+// Legacy per-query kernel over queries [0, mG): encode + commit, no wait.
+IvfIndex::Impl::PendingGpu
+IvfIndex::Impl::dispatchScan(const float* qPtr, const int32_t* probedPtr,
+                             int mG, int k, int nprobe) {
+    @autoreleasepool {
+        id<MTLBuffer> qBuf = [device
+            newBufferWithBytes:qPtr
+                        length:static_cast<size_t>(mG) * dim * sizeof(float)
+                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> probedBuf = [device
+            newBufferWithBytes:probedPtr
+                        length:static_cast<size_t>(mG) * nprobe * sizeof(int32_t)
+                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outIdBuf = [device
+            newBufferWithLength:static_cast<size_t>(mG) * k * sizeof(int32_t)
+                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outValBuf = [device
+            newBufferWithLength:static_cast<size_t>(mG) * k * sizeof(float)
+                        options:MTLResourceStorageModeShared];
+
+        IvfParams p;
+        p.dim        = static_cast<uint32_t>(dim);
+        p.k          = static_cast<uint32_t>(k);
+        p.nprobe     = static_cast<uint32_t>(nprobe);
+        p.metric     = static_cast<uint32_t>(metric);
+        p.queryCount = static_cast<uint32_t>(mG);
+
+        id<MTLCommandBuffer>         cb  = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:scanPipe];
+        [enc setBuffer:dbBuf   offset:0 atIndex:0];
+        [enc setBuffer:cq->idBuffer()   offset:0 atIndex:1];
+        [enc setBuffer:cq->cellBuffer() offset:0 atIndex:2];
+        [enc setBuffer:qBuf           offset:0 atIndex:3];
+        [enc setBuffer:probedBuf      offset:0 atIndex:4];
+        [enc setBuffer:outIdBuf       offset:0 atIndex:5];
+        [enc setBuffer:outValBuf      offset:0 atIndex:6];
+        [enc setBytes:&p length:sizeof(p) atIndex:7];
+        // One threadgroup per query. Pick the largest threadgroup whose
+        // staged query (dim floats) + reduction scratch (tg × k × (float+int))
+        // fits the threadgroup-memory budget; round to a SIMD-width multiple.
+        const NSUInteger kk  = static_cast<NSUInteger>(k);
+        const NSUInteger qsh = static_cast<NSUInteger>(dim) * sizeof(float);
+        NSUInteger memTg = (qsh < 32000)
+            ? (32000 - qsh) / (kk * (sizeof(float) + sizeof(int)))
+            : 1;
+        NSUInteger tg = std::min<NSUInteger>(
+            scanPipe.maxTotalThreadsPerThreadgroup, 256);
+        tg = std::min<NSUInteger>(tg, std::max<NSUInteger>(memTg, 32));
+        // Floor to a power of two — the tree-merge reduction requires it.
+        NSUInteger pw = 32;
+        while (pw * 2 <= tg) pw *= 2;
+        tg = pw;
+
+        [enc setThreadgroupMemoryLength:qsh atIndex:0];
+        [enc setThreadgroupMemoryLength:tg * kk * sizeof(float) atIndex:1];
+        [enc setThreadgroupMemoryLength:tg * kk * sizeof(int)   atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(mG), 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+
+        PendingGpu pend;
+        pend.cb = cb; pend.outId = outIdBuf; pend.outVal = outValBuf; pend.rows = mG;
+        return pend;
     }
 }
 
@@ -686,103 +777,89 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
         return out;
     }
 
+    // Tiny batches: the GPU dispatch has a fixed ~2-4 ms cost that dwarfs the
+    // work — the multithreaded CPU path is measured 2-5x faster there.
+    if (m <= 4 && nprobe <= 64) {
+        searchCpu(*mImpl->cq, mImpl->reorderedDb, dim, mImpl->metric,
+                  qPtr, m, k, nprobe, out);
+        return out;
+    }
+
     // Coarse: the m × nprobe nearest cells per query (GPU FlatIndex or CPU).
     std::vector<int32_t> probed;
     mImpl->cq->probeCells(qPtr, m, nprobe, probed);
     const int32_t* probedPtr = probed.data();
 
-    // Query-tiled fine scan: when the batch is large enough that cells are
-    // probed by many queries (lambda = avg queries/cell), grouping queries by
-    // cell lets each staged db row serve ~Tq queries. Measured on M2 (SIFT1M,
-    // m=1000): ~1.1x at lambda~31, ~1.15x at lambda~62; the scan is not purely
-    // bandwidth-bound, so gains are modest — gate to where it clearly wins.
-    // Gated to dim%4==0 (half4 staging) and k<=32 (owner register budget);
-    // MFLAT_IVF_TILED=1/0 forces it on/off for benchmarking.
+    // Hybrid CPU+GPU split: give the batch tail to the (all-cores) CPU scan
+    // while the GPU crunches the head CONCURRENTLY (commit without waiting,
+    // unified memory = no copy tax). Measured CPU/GPU per-query ratio on M2 is
+    // ~2.6-4.7x at large batches; measured end-to-end the CPU slice runs slower
+    // than its solo benchmark (driver threads + shared bandwidth), so the safe
+    // share is 15% (1.08-1.14x net; 22% already straggles at nprobe=256). The CPU slice reuses the GPU-computed
+    // probe lists, so cell selection is identical across the batch; fine-scan
+    // precision differs per slice exactly as the documented CPU-vs-GPU
+    // difference (fp32 vs fp16 rows). MFLAT_IVF_HYBRID=1/0 forces on/off;
+    // MFLAT_IVF_CPU_FRAC tunes the CPU share.
+    int mCpu = 0;
     {
-        const double lambda = static_cast<double>(m) * nprobe / std::max(1, mImpl->nlist);
+        const char* hEnv = std::getenv("MFLAT_IVF_HYBRID");
+        const bool hybrid = hEnv ? hEnv[0] == '1' : (m >= 256);
+        if (hybrid) {
+            double frac = 0.15;
+            if (const char* f = std::getenv("MFLAT_IVF_CPU_FRAC")) {
+                frac = atof(f);
+                if (!(frac >= 0.0 && frac <= 0.9)) frac = 0.15;
+            }
+            mCpu = static_cast<int>(m * frac);
+        }
+    }
+    const int mGpu = m - mCpu;
+    if (mGpu == 0) {   // MFLAT_IVF_CPU_FRAC can push everything to the CPU
+        searchCpu(*mImpl->cq, mImpl->reorderedDb, dim, mImpl->metric,
+                  qPtr, m, k, nprobe, out, 0, probedPtr);
+        return out;
+    }
+
+    // Query-tiled fine scan for the GPU slice: when cells are probed by many
+    // queries (lambda = avg queries/cell), grouping queries by cell lets each
+    // staged db row serve ~Tq queries. Measured on M2 (SIFT1M, m=1000): ~1.1x
+    // at lambda~31, ~1.15x at lambda~62 — the scan is not purely bandwidth-
+    // bound, so gains are modest; gate to where it clearly wins. Gated to
+    // dim%4==0 (half4 staging) and k<=32 (owner register budget);
+    // MFLAT_IVF_TILED=1/0 forces it on/off for benchmarking.
+    bool tiled;
+    {
+        const double lambda = static_cast<double>(mGpu) * nprobe / std::max(1, mImpl->nlist);
         const char* tEnv = std::getenv("MFLAT_IVF_TILED");
         const uint32_t Tq = tileTq(), Cv = tileCv();
         const size_t tileMem = static_cast<size_t>(Tq) * dim * sizeof(float)
                              + static_cast<size_t>(Cv) * dim * sizeof(uint16_t)
                              + static_cast<size_t>(Cv) * Tq * sizeof(float);
-        bool tiled = mImpl->tiledPipe && mImpl->mergePipe
-                  && (dim & 3) == 0 && k <= 32
-                  && static_cast<uint64_t>(m) * nprobe < UINT32_MAX
-                  && static_cast<uint64_t>(m) * nprobe * k * 8ull <= (512ull << 20)
-                  && tileMem <= 30000   // partial buffers capped at 512 MB
-                  && (tEnv ? tEnv[0] == '1' : (lambda >= 16.0 && m >= 256));
+        tiled = mImpl->tiledPipe && mImpl->mergePipe
+             && (dim & 3) == 0 && k <= 32
+             && static_cast<uint64_t>(mGpu) * nprobe < UINT32_MAX
+             && static_cast<uint64_t>(mGpu) * nprobe * k * 8ull <= (512ull << 20)
+             && tileMem <= 30000   // partial buffers capped at 512 MB
+             && (tEnv ? tEnv[0] == '1' : (lambda >= 16.0 && mGpu >= 256));
         if (tiled)   // negative cell ids would corrupt the inversion histogram
-            for (const int32_t c : probed) if (c < 0) { tiled = false; break; }
-        if (tiled) {
-            mImpl->runTiledGpu(qPtr, probed, m, k, nprobe, out);
-            return out;
-        }
+            for (int i = 0; i < mGpu * nprobe; ++i)
+                if (probed[i] < 0) { tiled = false; break; }
     }
 
-    @autoreleasepool {
-        id<MTLBuffer> qBuf = [mImpl->device
-            newBufferWithBytes:qPtr
-                        length:static_cast<size_t>(m) * dim * sizeof(float)
-                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> probedBuf = [mImpl->device
-            newBufferWithBytes:probedPtr
-                        length:static_cast<size_t>(m) * nprobe * sizeof(int32_t)
-                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outIdBuf = [mImpl->device
-            newBufferWithLength:static_cast<size_t>(m) * k * sizeof(int32_t)
-                        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outValBuf = [mImpl->device
-            newBufferWithLength:static_cast<size_t>(m) * k * sizeof(float)
-                        options:MTLResourceStorageModeShared];
+    Impl::PendingGpu pend = tiled
+        ? mImpl->dispatchTiled(qPtr, probed, mGpu, k, nprobe)
+        : mImpl->dispatchScan(qPtr, probedPtr, mGpu, k, nprobe);
 
-        IvfParams p;
-        p.dim        = static_cast<uint32_t>(dim);
-        p.k          = static_cast<uint32_t>(k);
-        p.nprobe     = static_cast<uint32_t>(nprobe);
-        p.metric     = static_cast<uint32_t>(mImpl->metric);
-        p.queryCount = static_cast<uint32_t>(m);
+    // CPU slice runs while the GPU executes; then wait and copy the GPU rows.
+    if (mCpu > 0)
+        searchCpu(*mImpl->cq, mImpl->reorderedDb, dim, mImpl->metric,
+                  qPtr, mCpu, k, nprobe, out, /*qOffset=*/mGpu, probedPtr);
 
-        id<MTLCommandBuffer>         cb  = [mImpl->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:mImpl->scanPipe];
-        [enc setBuffer:mImpl->dbBuf   offset:0 atIndex:0];
-        [enc setBuffer:mImpl->cq->idBuffer()   offset:0 atIndex:1];
-        [enc setBuffer:mImpl->cq->cellBuffer() offset:0 atIndex:2];
-        [enc setBuffer:qBuf           offset:0 atIndex:3];
-        [enc setBuffer:probedBuf      offset:0 atIndex:4];
-        [enc setBuffer:outIdBuf       offset:0 atIndex:5];
-        [enc setBuffer:outValBuf      offset:0 atIndex:6];
-        [enc setBytes:&p length:sizeof(p) atIndex:7];
-        // One threadgroup per query. Pick the largest threadgroup whose
-        // staged query (dim floats) + reduction scratch (tg × k × (float+int))
-        // fits the threadgroup-memory budget; round to a SIMD-width multiple.
-        const NSUInteger kk  = static_cast<NSUInteger>(k);
-        const NSUInteger qsh = static_cast<NSUInteger>(dim) * sizeof(float);
-        NSUInteger memTg = (qsh < 32000)
-            ? (32000 - qsh) / (kk * (sizeof(float) + sizeof(int)))
-            : 1;
-        NSUInteger tg = std::min<NSUInteger>(
-            mImpl->scanPipe.maxTotalThreadsPerThreadgroup, 256);
-        tg = std::min<NSUInteger>(tg, std::max<NSUInteger>(memTg, 32));
-        // Floor to a power of two — the tree-merge reduction requires it.
-        NSUInteger pw = 32;
-        while (pw * 2 <= tg) pw *= 2;
-        tg = pw;
-
-        [enc setThreadgroupMemoryLength:qsh atIndex:0];
-        [enc setThreadgroupMemoryLength:tg * kk * sizeof(float) atIndex:1];
-        [enc setThreadgroupMemoryLength:tg * kk * sizeof(int)   atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(m), 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
-
-        std::memcpy(out.ids.data(), [outIdBuf contents],
-                    out.ids.size() * sizeof(int32_t));
-        std::memcpy(out.distances.data(), [outValBuf contents],
-                    out.distances.size() * sizeof(float));
-    }
+    [pend.cb waitUntilCompleted];
+    std::memcpy(out.ids.data(), [pend.outId contents],
+                static_cast<size_t>(pend.rows) * k * sizeof(int32_t));
+    std::memcpy(out.distances.data(), [pend.outVal contents],
+                static_cast<size_t>(pend.rows) * k * sizeof(float));
     return out;
 }
 
