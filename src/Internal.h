@@ -18,29 +18,13 @@
 #include <vector>
 
 #include "metalflat/FlatIndex.h"   // FlatIndex, SearchResult, Metric
+#include "Distance.h"              // dot, sqL2, normalizeRows, score, ... (mflat::detail)
 
 namespace mflat {
 namespace detail {
 
-// L2-normalize each of the n rows (dim each) in place.
-inline void normalizeRows(std::vector<float>& v, int n, int dim) {
-    for (int i = 0; i < n; ++i) {
-        float* row = &v[static_cast<size_t>(i) * dim];
-        double s = 0.0;
-        for (int c = 0; c < dim; ++c) s += double(row[c]) * row[c];
-        if (s > 0.0) {
-            const float inv = static_cast<float>(1.0 / std::sqrt(s));
-            for (int c = 0; c < dim; ++c) row[c] *= inv;
-        }
-    }
-}
-
-// Squared L2 distance between two dim-vectors.
-inline float sqL2(const float* a, const float* b, int dim) {
-    float acc = 0.0f;
-    for (int c = 0; c < dim; ++c) { float e = a[c] - b[c]; acc += e * e; }
-    return acc;
-}
+// normalizeRows / sqL2 now live in Distance.h (same namespace); the callers here
+// and in the IVF sources resolve them unchanged.
 
 // Parallel map over [0, n) across hardware threads.
 template <typename Fn>
@@ -121,8 +105,11 @@ inline void kmeansGpu(const float* data, int n, int dim, int nlist, int iters,
     std::vector<int> perm(n);
     for (int i = 0; i < n; ++i) perm[i] = i;
     std::shuffle(perm.begin(), perm.end(), rng);
+    // nlist > n (e.g. PQ's fixed 256 sub-centroids on a tiny training set):
+    // wrap the permutation — duplicate seeds are degenerate but defined, and
+    // accumulateCentroids' empty-cluster reseed separates them over iterations.
     for (int c = 0; c < nlist; ++c)
-        std::copy_n(data + static_cast<size_t>(perm[c]) * dim, dim,
+        std::copy_n(data + static_cast<size_t>(perm[c % n]) * dim, dim,
                     centroids.begin() + static_cast<size_t>(c) * dim);
 
     FlatIndex assigner(dim, Metric::L2);

@@ -38,6 +38,9 @@
 #include "metalflat/FlatIndex.h"
 #include "Internal.h"
 #include "Log_internal.h"
+#include "PqTrainer.h"
+#include "CoarseQuantizer.h"
+#include "Opq.h"
 
 namespace mflat {
 
@@ -55,19 +58,28 @@ struct PqParams {
     uint32_t m;
     uint32_t dsub;
     uint32_t queryCount;
+    uint32_t residual;   // 1 = residual ADC (precomp + coarse terms active)
 };
 
 NSString* const kShaderSrc = @R"(
 #include <metal_stdlib>
 using namespace metal;
 
-struct PqParams { uint dim; uint k; uint nprobe; uint m; uint dsub; uint queryCount; };
+struct PqParams { uint dim; uint k; uint nprobe; uint m; uint dsub; uint queryCount; uint residual; };
 constant uint kMaxK = 64;
 constant uint kKsub = 256;
 
 // One threadgroup per query. Build the per-query ADC table once, then scan
 // the probed cells' codes by table lookup, keeping a top-k per thread, then
 // tree-merge. Distances rank by score = -dist (larger = nearer).
+//
+// Non-residual: dist = sum_mm lut[mm][code], lut = ||pqc||^2 - 2 q·pqc
+//               (cell-independent; reported value adds ||q||^2).
+// Residual (x ~ c + r): dist = ||q-c||^2 + sum_mm (lut[mm][code]
+//               + precomp[cell][mm][code]) with precomp = 2 c·pqc — the
+//               classic decomposition that keeps the query LUT byte-identical
+//               to the non-residual one (built once per query, not per probe).
+//               ||q-c||^2 comes from the host in exact fp32 (coarseVals).
 kernel void ivfpq_adc(
     device const uchar* codes      [[buffer(0)]],   // dbCount × m
     device const int*   ids        [[buffer(1)]],   // dbCount
@@ -79,6 +91,8 @@ kernel void ivfpq_adc(
     device int*         outIds     [[buffer(7)]],
     device float*       outVal     [[buffer(8)]],
     constant PqParams&  p          [[buffer(9)]],
+    device const float* precomp    [[buffer(10)]],  // nlist × m × 256 (residual)
+    device const float* coarseVals [[buffer(11)]],  // queryCount × nprobe (residual)
     threadgroup float*  lut        [[threadgroup(0)]],   // m × 256
     threadgroup float*  redScore   [[threadgroup(1)]],   // tgs × k
     threadgroup int*    redId      [[threadgroup(2)]],   // tgs × k
@@ -89,10 +103,11 @@ kernel void ivfpq_adc(
     if (qi >= p.queryCount) return;
     const uint M = p.m, dsub = p.dsub, dim = p.dim;
     const uint k = min(p.k, kMaxK);
+    const bool res = (p.residual != 0u);
     device const float* q = queries + (uint64_t)qi * dim;
 
-    // Build the per-query lookup table once (cell-independent for non-residual
-    // PQ): lut[mm*256 + j] = ||pqc[mm][j]||^2 - 2 q_mm·pqc[mm][j].
+    // Per-query LUT (cell-independent and BYTE-IDENTICAL in both modes):
+    // lut[mm*256 + j] = ||pqc[mm][j]||^2 - 2 q_mm·pqc[mm][j].
     const uint lutN = M * kKsub;
     for (uint e = tid; e < lutN; e += tgs) {
         const uint mm = e / kKsub;
@@ -115,10 +130,19 @@ kernel void ivfpq_adc(
         if (cell < 0) continue;
         const int lo = cellStart[cell];
         const int hi = cellStart[cell + 1];
+        device const float* pc = precomp + (uint64_t)cell * M * kKsub;
+        const float base = res ? coarseVals[(uint64_t)qi * p.nprobe + pp] : 0.0f;
         for (int c = lo + (int)tid; c < hi; c += (int)tgs) {
             device const uchar* code = codes + (uint64_t)c * M;
-            float dist = 0.0;
-            for (uint mm = 0; mm < M; ++mm) dist += lut[mm * kKsub + code[mm]];
+            float dist = base;
+            if (res) {
+                for (uint mm = 0; mm < M; ++mm) {
+                    const uint cd = code[mm];
+                    dist += pc[mm * kKsub + cd] + lut[mm * kKsub + cd];
+                }
+            } else {
+                for (uint mm = 0; mm < M; ++mm) dist += lut[mm * kKsub + code[mm]];
+            }
             const float score = -dist;
             if (score > bestScore[0]) {
                 uint pos = 0;
@@ -158,8 +182,10 @@ kernel void ivfpq_adc(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0u) {
+        // Residual dist already IS ~||q-x||^2 (coarse term included); the
+        // non-residual LUT omits the per-query ||q||^2 constant, so add it back.
         float qn = 0.0;
-        for (uint d = 0; d < dim; ++d) qn += q[d] * q[d];   // report approx ||q-x||^2
+        if (!res) for (uint d = 0; d < dim; ++d) qn += q[d] * q[d];
         device int*   oi = outIds + (uint64_t)qi * k;
         device float* ov = outVal + (uint64_t)qi * k;
         for (uint i = 0; i < k; ++i) {
@@ -185,26 +211,31 @@ struct IvfPqIndex::Impl {
     int    dbCount = 0;
     bool   ready   = false;
 
-    std::vector<float>   centroids;       // nlist × dim
-    std::vector<float>   pqCentroids;     // m × 256 × dsub
-    std::vector<float>   pqNorms;         // m × 256
-    std::vector<int>     cellStart;       // nlist + 1
-    std::vector<uint8_t> reorderedCodes;  // dbCount × m
-    std::vector<int>     reorderedIds;    // dbCount
+    std::unique_ptr<CoarseQuantizer>   cq;   // centroids + CSR + coarse FlatIndex + cell/id bufs
+    std::unique_ptr<detail::PqTrainer> pq;   // PQ codebooks + norms + encode/LUT
+    std::vector<uint8_t> reorderedCodes;  // dbCount × m (payload, CSR slot order)
 
     bool                 storeFull = false;  // keep full vectors for reranking
     std::vector<float>   fullById;           // dbCount × dim, ORIGINAL id order
+                                             // (rotated space when OPQ is on)
 
-    id<MTLDevice>               device   = nil;
-    id<MTLCommandQueue>         queue    = nil;
-    id<MTLComputePipelineState> adcPipe  = nil;
-    std::unique_ptr<FlatIndex>  coarse;
-    id<MTLBuffer>               codesBuf = nil;
-    id<MTLBuffer>               idBuf    = nil;
-    id<MTLBuffer>               cellBuf  = nil;
-    id<MTLBuffer>               pqcBuf   = nil;
-    id<MTLBuffer>               pqnBuf   = nil;
-    bool                        gpuReady = false;
+    bool               residual = true;      // requested: PQ on x - coarse_centroid
+    bool               opq      = false;     // requested: learned rotation pre-transform
+    // Latched at build(): what the CURRENT index actually contains. search()
+    // consults ONLY these — toggling the setters after build() cannot corrupt
+    // an already-built index (it applies to the next build()).
+    bool               residualActive = true;
+    bool               opqActive      = false;
+    std::vector<float> opqR;                 // dim × dim rotation (row-major)
+    std::vector<float> precomp;              // nlist × m × 256 residual ADC table
+
+    id<MTLDevice>               device     = nil;
+    id<MTLCommandQueue>         queue      = nil;
+    id<MTLComputePipelineState> adcPipe    = nil;
+    id<MTLBuffer>               codesBuf   = nil;
+    id<MTLBuffer>               pqcBuf     = nil;
+    id<MTLBuffer>               pqnBuf     = nil;
+    id<MTLBuffer>               precompBuf = nil;
 
     // GPU ADC search producing the kRun-NN shortlist (qPtr pre-normalized).
     // Member so it can touch the GPU buffers; caller ensures kRun<=kMaxK + GPU.
@@ -218,32 +249,37 @@ IvfPqIndex::IvfPqIndex(int dim, Metric metric, int nlist, int m)
     mImpl->nlist  = nlist;
     mImpl->m      = m;
     mImpl->dsub   = (m > 0) ? dim / m : 0;
+    mImpl->pq     = std::make_unique<detail::PqTrainer>(dim, m);
 
     if (m <= 0 || dim <= 0 || dim % m != 0) {
         MFLAT_LOG_ERROR("IvfPqIndex: m (%d) must divide dim (%d)", m, dim);
         return;
     }
     mImpl->device = acquireMetalDevice();
-    if (!mImpl->device) return;   // CPU-only path stays available
-    mImpl->queue = [mImpl->device newCommandQueue];
-
-    NSError* err = nil;
-    id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kShaderSrc options:nil error:&err];
-    if (!lib) {
-        MFLAT_LOG_ERROR("ivfpq shader compile failed: %s",
-                        err ? [[err localizedDescription] UTF8String] : "?");
-        return;
+    if (mImpl->device) {
+        mImpl->queue = [mImpl->device newCommandQueue];
+        NSError* err = nil;
+        id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kShaderSrc options:nil error:&err];
+        if (!lib) {
+            MFLAT_LOG_ERROR("ivfpq shader compile failed: %s",
+                            err ? [[err localizedDescription] UTF8String] : "?");
+        } else {
+            id<MTLFunction> fn = [lib newFunctionWithName:@"ivfpq_adc"];
+            mImpl->adcPipe = [mImpl->device newComputePipelineStateWithFunction:fn error:&err];
+            if (!mImpl->adcPipe)
+                MFLAT_LOG_ERROR("ivfpq pipeline build failed: %s",
+                                err ? [[err localizedDescription] UTF8String] : "?");
+        }
     }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"ivfpq_adc"];
-    mImpl->adcPipe = [mImpl->device newComputePipelineStateWithFunction:fn error:&err];
-    if (!mImpl->adcPipe)
-        MFLAT_LOG_ERROR("ivfpq pipeline build failed: %s",
-                        err ? [[err localizedDescription] UTF8String] : "?");
+    // Coarse quantizer uses the device only when the ADC pipeline is usable.
+    mImpl->cq = std::make_unique<CoarseQuantizer>(mImpl->adcPipe ? mImpl->device : nil, dim);
 }
 
 IvfPqIndex::~IvfPqIndex() = default;
 
-void IvfPqIndex::setRerank(bool enable) { mImpl->storeFull = enable; }
+void IvfPqIndex::setRerank(bool enable)   { mImpl->storeFull = enable; }
+void IvfPqIndex::setResidual(bool enable) { mImpl->residual  = enable; }
+void IvfPqIndex::setOpq(bool enable)      { mImpl->opq       = enable; }
 
 int IvfPqIndex::dim()           const { return mImpl->dim; }
 int IvfPqIndex::size()          const { return mImpl->dbCount; }
@@ -253,139 +289,165 @@ bool IvfPqIndex::ready()        const { return mImpl->ready; }
 
 void IvfPqIndex::build(const float* vectors, int n) {
     if (n <= 0 || mImpl->dim <= 0 || mImpl->m <= 0 || mImpl->dim % mImpl->m != 0) return;
-    const int dim = mImpl->dim, M = mImpl->m, dsub = mImpl->dsub;
+    const int dim = mImpl->dim, M = mImpl->m;
 
     std::vector<float> data(vectors, vectors + static_cast<size_t>(n) * dim);
     if (mImpl->metric == Metric::Cosine) normalizeRows(data, n, dim);
 
-    const int nlist = std::min(mImpl->nlist, n);
-    mImpl->nlist = nlist;
     constexpr int kIters = 12;
 
-    // 1. coarse quantizer.
-    std::vector<int> assign;
-    kmeansGpu(data.data(), n, dim, nlist, kIters, mImpl->centroids, assign);
-
-    // 2. PQ training (non-residual) + 3. encode, one sub-space at a time.
-    mImpl->pqCentroids.assign(static_cast<size_t>(M) * kKsub * dsub, 0.0f);
-    mImpl->pqNorms.assign(static_cast<size_t>(M) * kKsub, 0.0f);
-    std::vector<uint8_t> codes(static_cast<size_t>(n) * M);
-    std::vector<float>   sub(static_cast<size_t>(n) * dsub);
-    for (int mm = 0; mm < M; ++mm) {
-        parallelFor(n, [&](int i) {
-            std::copy_n(&data[static_cast<size_t>(i) * dim + mm * dsub], dsub,
-                        &sub[static_cast<size_t>(i) * dsub]);
-        });
-        std::vector<float> subCent;
-        std::vector<int>   subAssign;
-        kmeansGpu(sub.data(), n, dsub, kKsub, kIters, subCent, subAssign);
-        std::copy(subCent.begin(), subCent.end(),
-                  &mImpl->pqCentroids[static_cast<size_t>(mm) * kKsub * dsub]);
-        for (int j = 0; j < kKsub; ++j) {
-            float nn = 0.0f;
-            for (int d = 0; d < dsub; ++d) {
-                const float v = subCent[static_cast<size_t>(j) * dsub + d];
-                nn += v * v;
-            }
-            mImpl->pqNorms[static_cast<size_t>(mm) * kKsub + j] = nn;
+    // OPQ pre-transform: learn R on a shuffled sample, then rotate the whole
+    // db. Everything downstream (coarse, residuals, PQ, rerank store, queries)
+    // lives in rotated space; orthogonality preserves L2/Cosine exactly.
+    if (mImpl->opq) {
+        const int ns = std::min(n, 65536);
+        std::vector<float> sample;
+        const float* sPtr = data.data();
+        if (ns < n) {
+            std::vector<int> perm(n);
+            for (int i = 0; i < n; ++i) perm[i] = i;
+            std::mt19937 rng(12345);
+            std::shuffle(perm.begin(), perm.end(), rng);
+            sample.resize(static_cast<size_t>(ns) * dim);
+            parallelFor(ns, [&](int i) {
+                std::copy_n(&data[static_cast<size_t>(perm[i]) * dim], dim,
+                            &sample[static_cast<size_t>(i) * dim]);
+            });
+            sPtr = sample.data();
         }
-        for (int i = 0; i < n; ++i)
-            codes[static_cast<size_t>(i) * M + mm] = static_cast<uint8_t>(subAssign[i]);
+        mImpl->opqR = trainOpqRotation(sPtr, ns, dim, M);
+        std::vector<float> rotated(data.size());
+        applyRotation(mImpl->opqR.data(), data.data(), rotated.data(), n, dim);
+        data.swap(rotated);
+    } else {
+        mImpl->opqR.clear();
     }
 
-    // CSR reorder codes by cell.
-    mImpl->cellStart.assign(nlist + 1, 0);
-    for (int i = 0; i < n; ++i) ++mImpl->cellStart[assign[i] + 1];
-    for (int c = 0; c < nlist; ++c) mImpl->cellStart[c + 1] += mImpl->cellStart[c];
-    mImpl->reorderedCodes.assign(static_cast<size_t>(n) * M, 0);
-    mImpl->reorderedIds.assign(n, 0);
-    std::vector<int> cursor(mImpl->cellStart.begin(), mImpl->cellStart.end());
-    for (int i = 0; i < n; ++i) {
-        const int c = assign[i];
-        const int pos = cursor[c]++;
-        std::copy_n(&codes[static_cast<size_t>(i) * M], M,
-                    &mImpl->reorderedCodes[static_cast<size_t>(pos) * M]);
-        mImpl->reorderedIds[pos] = i;
-    }
+    // Coarse quantizer FIRST (residual encoding needs the cell assignment).
+    mImpl->cq->train(data.data(), n, mImpl->nlist, kIters,
+                     CoarseQuantizer::KmeansBackend::ForceGpuAssign);
+    mImpl->nlist = mImpl->cq->nlist();
 
-    // Keep full vectors (original id order) for exact reranking, if enabled.
+    // Keep full vectors (original id order; rotated space when OPQ) for exact
+    // reranking — snapshot BEFORE the residual subtraction below.
     if (mImpl->storeFull) mImpl->fullById = data;
+
+    // Residual mode: PQ quantizes r = x - coarse_centroid(x). Residuals are
+    // much smaller than raw vectors, so the same m bytes carry far more
+    // precision. Assignment is reconstructed from the CSR (cells disjoint).
+    if (mImpl->residual) {
+        const std::vector<int>& cs  = mImpl->cq->cellStart();
+        const std::vector<int>& rid = mImpl->cq->reorderedIds();
+        std::vector<int32_t> assign(n);
+        parallelFor(mImpl->nlist, [&](int c) {
+            for (int j = cs[c]; j < cs[c + 1]; ++j) assign[rid[j]] = c;
+        });
+        const std::vector<float>& cent = mImpl->cq->centroids();
+        parallelFor(n, [&](int i) {
+            float*       v = &data[static_cast<size_t>(i) * dim];
+            const float* c = &cent[static_cast<size_t>(assign[i]) * dim];
+            for (int d = 0; d < dim; ++d) v[d] -= c[d];
+        });
+    }
+
+    // PQ training on residuals (or raw vectors when residual is off); codes
+    // come straight from the sub-space k-means assignment (bit-exact).
+    std::vector<uint8_t> codes(static_cast<size_t>(n) * M);
+    mImpl->pq->train(data.data(), n, kIters, &codes);
+
+    // Reorder the m-byte codes into CSR slot order (id order -> slots).
+    mImpl->reorderedCodes.assign(static_cast<size_t>(n) * M, 0);
+    mImpl->cq->reorderPayload(codes.data(), mImpl->reorderedCodes.data(),
+                              static_cast<size_t>(M));
+
+    // Residual ADC cross table T[cell][mm][j] = 2 c·pqc (see kernel comment).
+    if (mImpl->residual) {
+        mImpl->precomp.assign(static_cast<size_t>(mImpl->nlist) * mImpl->pq->lutSize(), 0.0f);
+        mImpl->pq->buildCellTable(mImpl->cq->centroids().data(), mImpl->nlist,
+                                  mImpl->precomp.data());
+    } else {
+        mImpl->precomp.clear();
+    }
 
     mImpl->dbCount = n;
     mImpl->ready   = true;
 
-    // GPU setup: coarse FlatIndex + upload codes/centroids/tables.
-    if (mImpl->adcPipe) {
-        mImpl->coarse = std::make_unique<FlatIndex>(dim, Metric::L2);
-        mImpl->coarse->add(mImpl->centroids.data(), nlist);
+    // GPU setup: upload codes + PQ tables (cell/id buffers live in the CQ).
+    if (mImpl->adcPipe && mImpl->cq->gpuReady()) {
         auto buf = [&](const void* p, size_t bytes) {
             return [mImpl->device newBufferWithBytes:p length:bytes
                                              options:MTLResourceStorageModeShared];
         };
-        mImpl->codesBuf = buf(mImpl->reorderedCodes.data(), mImpl->reorderedCodes.size());
-        mImpl->idBuf    = buf(mImpl->reorderedIds.data(),  mImpl->reorderedIds.size() * sizeof(int32_t));
-        mImpl->cellBuf  = buf(mImpl->cellStart.data(),     mImpl->cellStart.size() * sizeof(int32_t));
-        mImpl->pqcBuf   = buf(mImpl->pqCentroids.data(),   mImpl->pqCentroids.size() * sizeof(float));
-        mImpl->pqnBuf   = buf(mImpl->pqNorms.data(),       mImpl->pqNorms.size() * sizeof(float));
-        mImpl->gpuReady = mImpl->coarse->ready();
+        mImpl->codesBuf   = buf(mImpl->reorderedCodes.data(), mImpl->reorderedCodes.size());
+        mImpl->pqcBuf     = buf(mImpl->pq->centroids().data(), mImpl->pq->centroids().size() * sizeof(float));
+        mImpl->pqnBuf     = buf(mImpl->pq->norms().data(),     mImpl->pq->norms().size() * sizeof(float));
+        mImpl->precompBuf = mImpl->residual
+            ? buf(mImpl->precomp.data(), mImpl->precomp.size() * sizeof(float))
+            : nil;
     }
+
+    // Latch the mode flags this index was actually built with (see Impl).
+    mImpl->residualActive = mImpl->residual;
+    mImpl->opqActive      = mImpl->opq;
 }
 
 namespace {
 
 // CPU ADC fallback (also the recall reference): exact over the stored codes.
-// Takes raw fields (not the private Impl) so it stays a free function.
-void searchCpu(int dim, int M, int dsub, int nlist,
-               const std::vector<float>&   centroids,
-               const std::vector<float>&   pqCentroids,
-               const std::vector<float>&   pqNorms,
-               const std::vector<int>&     cellStart,
+// Takes raw fields (not the private Impl) so it stays a free function. Mirrors
+// the kernel term-for-term, including the residual decomposition.
+void searchCpu(int dim, const CoarseQuantizer& cq,
+               const detail::PqTrainer&    pq,
                const std::vector<uint8_t>& reorderedCodes,
-               const std::vector<int>&     reorderedIds,
+               bool residual, const std::vector<float>& precomp,
                const float* qPtr, int m, int k, int nprobe, SearchResult& out) {
+    const int M = pq.codeBytes(), ksub = pq.ksub();
+    const std::vector<int>&   cellStart    = cq.cellStart();
+    const std::vector<int>&   reorderedIds = cq.reorderedIds();
+    const std::vector<float>& cent         = cq.centroids();
     parallelFor(m, [&](int qi) {
         const float* q = qPtr + static_cast<size_t>(qi) * dim;
-        std::vector<float> lut(static_cast<size_t>(M) * kKsub);
-        for (int mm = 0; mm < M; ++mm)
-            for (int j = 0; j < kKsub; ++j) {
-                const float* sub = &pqCentroids[(static_cast<size_t>(mm) * kKsub + j) * dsub];
-                const float* qm  = q + static_cast<size_t>(mm) * dsub;
-                float dot = 0.0f;
-                for (int d = 0; d < dsub; ++d) dot += qm[d] * sub[d];
-                lut[static_cast<size_t>(mm) * kKsub + j] =
-                    pqNorms[static_cast<size_t>(mm) * kKsub + j] - 2.0f * dot;
-            }
-        std::vector<std::pair<float, int>> cd(nlist);
-        for (int c = 0; c < nlist; ++c) {
-            const float* ce = &centroids[static_cast<size_t>(c) * dim];
-            float dd = 0.0f;
-            for (int d = 0; d < dim; ++d) { float e = q[d] - ce[d]; dd += e * e; }
-            cd[c] = {dd, c};
-        }
-        std::partial_sort(cd.begin(), cd.begin() + nprobe, cd.end());
+        std::vector<float> lut(static_cast<size_t>(pq.lutSize()));
+        pq.buildAdcTable(q, lut.data());
+        std::vector<int> cells(nprobe);
+        cq.probeCellsCpu(q, nprobe, cells.data());
         std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
         std::vector<int>   bestId(k, -1);
         for (int pp = 0; pp < nprobe; ++pp) {
-            const int c = cd[pp].second;
+            const int c = cells[pp];
+            // Residual terms: exact fp32 coarse ||q-c||^2 + the per-cell table.
+            const float base = residual
+                ? sqL2(q, &cent[static_cast<size_t>(c) * dim], dim) : 0.0f;
+            const float* Tc = residual
+                ? &precomp[static_cast<size_t>(c) * M * ksub] : nullptr;
             for (int j = cellStart[c]; j < cellStart[c + 1]; ++j) {
                 const uint8_t* code = &reorderedCodes[static_cast<size_t>(j) * M];
-                float dist = 0.0f;
-                for (int mm = 0; mm < M; ++mm) dist += lut[static_cast<size_t>(mm) * kKsub + code[mm]];
-                const float score = -dist;
-                if (score > bestScore[0]) {
+                float dist = base;
+                if (residual) {
+                    for (int mm = 0; mm < M; ++mm) {
+                        const int cd = code[mm];
+                        dist += lut[static_cast<size_t>(mm) * ksub + cd]
+                              + Tc[static_cast<size_t>(mm) * ksub + cd];
+                    }
+                } else {
+                    for (int mm = 0; mm < M; ++mm)
+                        dist += lut[static_cast<size_t>(mm) * ksub + code[mm]];
+                }
+                const float s = -dist;
+                if (s > bestScore[0]) {
                     int pos = 0;
-                    while (pos + 1 < k && score > bestScore[pos + 1]) {
+                    while (pos + 1 < k && s > bestScore[pos + 1]) {
                         bestScore[pos] = bestScore[pos + 1];
                         bestId[pos]    = bestId[pos + 1];
                         ++pos;
                     }
-                    bestScore[pos] = score;
+                    bestScore[pos] = s;
                     bestId[pos]    = reorderedIds[j];
                 }
             }
         }
-        float qn = 0.0f;
-        for (int d = 0; d < dim; ++d) qn += q[d] * q[d];
+        // Residual dist already IS ~||q-x||^2; non-residual adds ||q||^2 back.
+        const float qn = residual ? 0.0f : dot(q, q, dim);
         for (int i = 0; i < k; ++i) {
             const int src = k - 1 - i;
             const size_t o = static_cast<size_t>(qi) * k + i;
@@ -402,28 +464,27 @@ void searchCpu(int dim, int M, int dsub, int nlist,
 // and a usable GPU.
 void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
                                 int nprobe, SearchResult& pq) {
-    SearchResult coarseRes;
-    std::vector<int32_t> probedCpu;
-    const int32_t* probedPtr = nullptr;
-    if (nprobe <= FlatIndex::kMaxK) {
-        coarseRes = coarse->search(qPtr, m, nprobe);
-        probedPtr = coarseRes.ids.data();
-    } else {
-        probedCpu.assign(static_cast<size_t>(m) * nprobe, -1);
+    std::vector<int32_t> probed;
+    cq->probeCells(qPtr, m, nprobe, probed);   // m × nprobe nearest cells
+    const int32_t* probedPtr = probed.data();
+
+    // Residual coarse term ||q-c||^2 per probed cell, computed EXACTLY on the
+    // host in fp32 (the coarse FlatIndex's own distances are fp16-derived —
+    // reusing them would inject fp16 error into every candidate score).
+    std::vector<float> coarseVals;
+    if (residualActive) {
+        coarseVals.resize(static_cast<size_t>(m) * nprobe);
+        const std::vector<float>& cent = cq->centroids();
+        const int d = this->dim;
         parallelFor(m, [&](int qi) {
-            const float* q = qPtr + static_cast<size_t>(qi) * dim;
-            std::vector<std::pair<float, int>> cd(nlist);
-            for (int c = 0; c < nlist; ++c) {
-                const float* ce = &centroids[static_cast<size_t>(c) * dim];
-                float dd = 0.0f;
-                for (int d = 0; d < dim; ++d) { float e = q[d] - ce[d]; dd += e * e; }
-                cd[c] = {dd, c};
+            const float* q = qPtr + static_cast<size_t>(qi) * d;
+            for (int pp = 0; pp < nprobe; ++pp) {
+                const int c = probed[static_cast<size_t>(qi) * nprobe + pp];
+                coarseVals[static_cast<size_t>(qi) * nprobe + pp] = (c >= 0)
+                    ? sqL2(q, &cent[static_cast<size_t>(c) * d], d)
+                    : std::numeric_limits<float>::infinity();
             }
-            std::partial_sort(cd.begin(), cd.begin() + nprobe, cd.end());
-            int32_t* row = &probedCpu[static_cast<size_t>(qi) * nprobe];
-            for (int p = 0; p < nprobe; ++p) row[p] = cd[p].second;
         });
-        probedPtr = probedCpu.data();
     }
 
     @autoreleasepool {
@@ -438,16 +499,23 @@ void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
         id<MTLBuffer> outValBuf = [device newBufferWithLength:static_cast<size_t>(m) * kRun * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
 
+        // Residual-only buffers; pqnBuf stands in when unused (the kernel never
+        // reads buffers 10/11 with residual==0, but Metal wants a binding).
+        id<MTLBuffer> cvBuf = residualActive
+            ? bufWith(coarseVals.data(), coarseVals.size() * sizeof(float))
+            : pqnBuf;
+
         PqParams p;
         p.dim = (uint32_t)dim; p.k = (uint32_t)kRun; p.nprobe = (uint32_t)nprobe;
         p.m = (uint32_t)this->m; p.dsub = (uint32_t)dsub; p.queryCount = (uint32_t)m;
+        p.residual = residualActive ? 1u : 0u;
 
         id<MTLCommandBuffer>         cb  = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:adcPipe];
         [enc setBuffer:codesBuf offset:0 atIndex:0];
-        [enc setBuffer:idBuf    offset:0 atIndex:1];
-        [enc setBuffer:cellBuf  offset:0 atIndex:2];
+        [enc setBuffer:cq->idBuffer()   offset:0 atIndex:1];
+        [enc setBuffer:cq->cellBuffer() offset:0 atIndex:2];
         [enc setBuffer:qBuf     offset:0 atIndex:3];
         [enc setBuffer:probedBuf offset:0 atIndex:4];
         [enc setBuffer:pqcBuf   offset:0 atIndex:5];
@@ -455,6 +523,8 @@ void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
         [enc setBuffer:outIdBuf offset:0 atIndex:7];
         [enc setBuffer:outValBuf offset:0 atIndex:8];
         [enc setBytes:&p length:sizeof(p) atIndex:9];
+        [enc setBuffer:(residualActive ? precompBuf : pqnBuf) offset:0 atIndex:10];
+        [enc setBuffer:cvBuf offset:0 atIndex:11];
 
         const NSUInteger kk  = static_cast<NSUInteger>(kRun);
         const NSUInteger lutBytes = static_cast<NSUInteger>(this->m) * kKsub * sizeof(float);
@@ -497,6 +567,15 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
         qPtr = qNorm.data();
     }
 
+    // OPQ: rotate queries into the index's space, exactly once — the shortlist
+    // AND the rerank both use qPtr (fullById is stored rotated too).
+    std::vector<float> qRot;
+    if (mImpl->opqActive && !mImpl->opqR.empty()) {
+        qRot.resize(static_cast<size_t>(m) * dim);
+        applyRotation(mImpl->opqR.data(), qPtr, qRot.data(), m, dim);
+        qPtr = qRot.data();
+    }
+
     const bool doRerank = rerank > k && mImpl->storeFull && !mImpl->fullById.empty();
     const int  kRun = doRerank ? std::min(rerank, mImpl->dbCount) : k;
 
@@ -505,14 +584,13 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
     pq.ids.assign(static_cast<size_t>(m) * kRun, -1);
     pq.distances.assign(static_cast<size_t>(m) * kRun, std::numeric_limits<float>::infinity());
 
-    const bool useGpu = mImpl->gpuReady && mImpl->coarse && mImpl->adcPipe && kRun <= kMaxK;
+    const bool useGpu = mImpl->adcPipe && mImpl->cq->gpuReady() && kRun <= kMaxK;
     if (useGpu) {
         mImpl->runPqGpu(qPtr, m, kRun, nprobe, pq);
     } else {
-        searchCpu(dim, mImpl->m, mImpl->dsub, nlist, mImpl->centroids,
-                  mImpl->pqCentroids, mImpl->pqNorms, mImpl->cellStart,
-                  mImpl->reorderedCodes, mImpl->reorderedIds,
-                  qPtr, m, kRun, nprobe, pq);
+        searchCpu(dim, *mImpl->cq, *mImpl->pq, mImpl->reorderedCodes,
+                  mImpl->residualActive, mImpl->precomp,
+                  qPtr, m, kRun, nprobe, pq);   // *mImpl->cq/pq = subsystems, pq = out
     }
 
     if (!doRerank) return pq;
@@ -520,8 +598,7 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
     // ---- exact rerank of the shortlist down to the true top-k -----------
     out.ids.assign(static_cast<size_t>(m) * k, -1);
     out.distances.assign(static_cast<size_t>(m) * k, std::numeric_limits<float>::infinity());
-    const bool isL2 = (mImpl->metric == Metric::L2);   // else Cosine (rank by dot)
-    const std::vector<float>& full = mImpl->fullById;
+    const std::vector<float>& full = mImpl->fullById;   // exact rerank vectors
     parallelFor(m, [&](int qi) {
         const float* q = qPtr + static_cast<size_t>(qi) * dim;
         std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
@@ -530,24 +607,15 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
             const int id = pq.ids[static_cast<size_t>(qi) * kRun + sIdx];
             if (id < 0) continue;
             const float* d = &full[static_cast<size_t>(id) * dim];
-            float score;
-            if (isL2) {
-                float acc = 0.0f;
-                for (int c = 0; c < dim; ++c) { float e = q[c] - d[c]; acc += e * e; }
-                score = -acc;
-            } else {
-                float acc = 0.0f;
-                for (int c = 0; c < dim; ++c) acc += q[c] * d[c];
-                score = acc;
-            }
-            if (score > bestScore[0]) {
+            const float s = detail::score(mImpl->metric, q, d, dim);
+            if (s > bestScore[0]) {
                 int pos = 0;
-                while (pos + 1 < k && score > bestScore[pos + 1]) {
+                while (pos + 1 < k && s > bestScore[pos + 1]) {
                     bestScore[pos] = bestScore[pos + 1];
                     bestId[pos]    = bestId[pos + 1];
                     ++pos;
                 }
-                bestScore[pos] = score;
+                bestScore[pos] = s;
                 bestId[pos]    = id;
             }
         }
@@ -555,7 +623,7 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
             const int src = k - 1 - i;
             const size_t o = static_cast<size_t>(qi) * k + i;
             out.ids[o]       = bestId[src];
-            out.distances[o] = isL2 ? -bestScore[src] : bestScore[src];
+            out.distances[o] = detail::scoreToValue(mImpl->metric, bestScore[src]);
         }
     });
     return out;

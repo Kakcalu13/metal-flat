@@ -15,8 +15,10 @@
 // Tradeoff: PQ is lossy, so recall is below IvfIndex/FlatIndex at the same
 // nprobe — the classic memory/recall dial. The win is scale: 10M-100M+
 // vectors that would not fit (or would be bandwidth-bound) as full floats.
+// Residual encoding (default, see setResidual) and OPQ (opt-in, see setOpq)
+// shrink the quantization loss; reranking (setRerank) recovers the rest.
 //
-// v1 supports Metric::L2 and Metric::Cosine (Cosine = L2 over L2-normalized
+// Supports Metric::L2 and Metric::Cosine (Cosine = L2 over L2-normalized
 // vectors). Pure InnerProduct is not yet supported on this index.
 //
 // Pure C++17 public surface (Metal hidden behind the pimpl), same as the
@@ -56,6 +58,22 @@ public:
     // `rerank`). Costs the full-vector memory, so it is off by default; for
     // pure compression leave it off. Must be called before build().
     void setRerank(bool enable);
+
+    // Residual encoding (DEFAULT ON): PQ-encode x - coarse_centroid(x) instead
+    // of x. Residuals are much smaller than raw vectors, so the same m bytes
+    // quantize far more precisely — a large recall boost at equal code size.
+    // Costs a build-time nlist×m×256-float table (~64 MB at nlist=4096, m=16).
+    // setResidual(false) restores the v1 cell-independent-LUT behavior.
+    // Latched at build(): calling after build() only affects the NEXT build().
+    void setResidual(bool enable);
+
+    // OPQ (Optimized Product Quantization, default OFF): learn an orthogonal
+    // rotation of the input space that minimizes PQ reconstruction error
+    // (Ge et al. 2013), then run the whole pipeline in rotated space. Adds
+    // build time (alternating minimization on a sample + rotating the db);
+    // search results are unchanged in meaning (rotation preserves L2/Cosine).
+    // Latched at build(): calling after build() only affects the NEXT build().
+    void setOpq(bool enable);
 
     // Train (coarse k-means + per-subspace PQ k-means), encode every vector
     // to an m-byte code, and arrange the codes into per-cell inverted lists.
