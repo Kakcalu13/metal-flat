@@ -3,9 +3,9 @@
 //
 // Internal, Obj-C++-only (pulls Internal.h for detail::kmeansGpu). Owns the PQ
 // sub-quantizer centroids and their precomputed norms, encodes vectors to m-byte
-// codes, and builds the per-query ADC lookup table. Designed so residual PQ can
-// be added later: encode()/buildAdcTable() take an arbitrary vector, so residual
-// PQ = feed (x - coarse_centroid).
+// codes, and builds the per-query ADC lookup table. Residual PQ: train()/encode()
+// take residuals (x - coarse_centroid); buildAdcTable() still takes the RAW
+// query (see its comment), with the cell cross term in buildCellTable().
 #pragma once
 
 #include <algorithm>
@@ -88,7 +88,10 @@ public:
     }
 
     // Per-query ADC lookup table: lut[mm*ksub + j] = ||pqc||^2 - 2 q_mm·pqc.
-    // (residual PQ: pass query - coarse_centroid). lut must hold lutSize().
+    // Takes the RAW query in BOTH plain and residual mode — the residual
+    // decomposition keeps this table cell-independent and routes the cross
+    // term through buildCellTable() and the coarse ||q-c||^2 scalar instead.
+    // lut must hold lutSize().
     void buildAdcTable(const float* query, float* lut) const {
         for (int mm = 0; mm < m_; ++mm)
             for (int j = 0; j < ksub_; ++j)
@@ -96,6 +99,23 @@ public:
                     norms_[static_cast<size_t>(mm) * ksub_ + j],
                     query + static_cast<size_t>(mm) * dsub_,
                     &centroids_[(static_cast<size_t>(mm) * ksub_ + j) * dsub_], dsub_);
+    }
+
+    // Residual-ADC per-cell cross table:
+    //   T[cell][mm][j] = 2 · dot(c_cell_mm, pqc[mm][j])
+    // so that ||q - c - r||^2 = ||q-c||^2 + lut[mm][code] + T[cell][mm][code]
+    // summed over mm. T must hold nlist * lutSize() floats (~64 MB at
+    // nlist=4096, m=16 — allocated only in residual mode).
+    void buildCellTable(const float* cellCentroids, int nlist, float* T) const {
+        parallelFor(nlist, [&](int l) {
+            const float* c = cellCentroids + static_cast<size_t>(l) * dim_;
+            float* Tl = T + static_cast<size_t>(l) * m_ * ksub_;
+            for (int mm = 0; mm < m_; ++mm)
+                for (int j = 0; j < ksub_; ++j)
+                    Tl[static_cast<size_t>(mm) * ksub_ + j] = 2.0f * dot(
+                        c + static_cast<size_t>(mm) * dsub_,
+                        &centroids_[(static_cast<size_t>(mm) * ksub_ + j) * dsub_], dsub_);
+        });
     }
 
 private:
