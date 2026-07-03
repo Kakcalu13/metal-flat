@@ -105,8 +105,11 @@ inline void kmeansGpu(const float* data, int n, int dim, int nlist, int iters,
     std::vector<int> perm(n);
     for (int i = 0; i < n; ++i) perm[i] = i;
     std::shuffle(perm.begin(), perm.end(), rng);
+    // nlist > n (e.g. PQ's fixed 256 sub-centroids on a tiny training set):
+    // wrap the permutation — duplicate seeds are degenerate but defined, and
+    // accumulateCentroids' empty-cluster reseed separates them over iterations.
     for (int c = 0; c < nlist; ++c)
-        std::copy_n(data + static_cast<size_t>(perm[c]) * dim, dim,
+        std::copy_n(data + static_cast<size_t>(perm[c % n]) * dim, dim,
                     centroids.begin() + static_cast<size_t>(c) * dim);
 
     FlatIndex assigner(dim, Metric::L2);
