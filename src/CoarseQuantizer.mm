@@ -110,8 +110,11 @@ void CoarseQuantizer::train(const float* data, int n, int nlistReq, int iters,
 
     std::vector<int> assign;
     if (backend == KmeansBackend::ForceGpuAssign || mImpl->device) {
-        // Assignment via a reused FlatIndex (GEMM on GPU, exact CPU fallback).
-        kmeansGpu(data, n, dim, nlist, iters, mImpl->centroids, assign);
+        // Fused GPU assignment (kmeans_assign kernel; GEMM/CPU fallback inside).
+        // Training subsamples to 256 points/centroid (faiss convention) — the
+        // final all-points assignment pass is unaffected.
+        kmeansGpu(data, n, dim, nlist, iters, mImpl->centroids, assign,
+                  /*maxPointsPerCentroid=*/256);
     } else {
         // No device: scalar CPU k-means + one assignment pass.
         kmeans(data, n, dim, nlist, iters, mImpl->centroids);

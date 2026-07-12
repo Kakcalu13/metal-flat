@@ -16,8 +16,10 @@
 // tunable via nprobe — higher nprobe = more cells scanned = more recall,
 // less speed). This is the path past the exact-flat compute floor.
 //
-// k-means + CSR build are CPU (one-time). The per-query fine scan — the
-// hot path — runs on the GPU.
+// Build runs the k-means assignment on the GPU (fused kmeans_assign
+// kernel via detail::kmeansGpu, training subsampled faiss-style); the
+// centroid update + CSR reorder stay CPU. The per-query fine scan — the
+// hot path — also runs on the GPU.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -501,13 +503,25 @@ void IvfIndex::build(const float* vectors, int n) {
     mImpl->ready = true;
 
     if (mImpl->scanPipe && mImpl->cq->gpuReady()) {
-        std::vector<__fp16> dbHalf(mImpl->reorderedDb.size());
-        for (size_t i = 0; i < dbHalf.size(); ++i)
-            dbHalf[i] = static_cast<__fp16>(mImpl->reorderedDb[i]);
+        // Parallel cast straight into the shared scan buffer — no fp16
+        // staging vector, no second copy (unified memory).
         mImpl->dbBuf = [mImpl->device
-            newBufferWithBytes:dbHalf.data()
-                        length:dbHalf.size() * sizeof(__fp16)
-                       options:MTLResourceStorageModeShared];
+            newBufferWithLength:mImpl->reorderedDb.size() * sizeof(__fp16)
+                        options:MTLResourceStorageModeShared];
+        if (mImpl->dbBuf) {
+            __fp16*      dst = static_cast<__fp16*>([mImpl->dbBuf contents]);
+            const float* src = mImpl->reorderedDb.data();
+            parallelFor(n, [&](int i) {
+                const size_t o = static_cast<size_t>(i) * dim;
+                for (int c = 0; c < dim; ++c)
+                    dst[o + c] = static_cast<__fp16>(src[o + c]);
+            });
+        } else {
+            // Exceeds maxBufferLength / allocation failed: search()'s dbBuf
+            // gate sends every query to the (correct) CPU path.
+            MFLAT_LOG_WARN("ivf fp16 db buffer alloc failed (%zu bytes) — GPU fine scan disabled",
+                           mImpl->reorderedDb.size() * sizeof(__fp16));
+        }
     }
 }
 
@@ -770,7 +784,8 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
     // falls to the exact CPU path (the GPU top-k uses fixed kMaxK-sized buffers).
     // MFLAT_IVF_CPU forces the CPU path regardless (benchmarking / hybrid split).
     const bool forceCpu = std::getenv("MFLAT_IVF_CPU") != nullptr;
-    const bool gpuPath = !forceCpu && mImpl->scanPipe && mImpl->cq->gpuReady() && k <= kMaxK;
+    const bool gpuPath = !forceCpu && mImpl->scanPipe && mImpl->dbBuf
+                      && mImpl->cq->gpuReady() && k <= kMaxK;
     if (!gpuPath) {
         searchCpu(*mImpl->cq, mImpl->reorderedDb, dim, mImpl->metric,
                   qPtr, m, k, nprobe, out);
