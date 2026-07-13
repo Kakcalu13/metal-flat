@@ -17,11 +17,13 @@
 #include <new>
 
 #include "metalflat/FlatIndex.h"
+#include "metalflat/GraphIndex.h"
 #include "metalflat/IvfIndex.h"
 #include "metalflat/IvfPqIndex.h"
 #include "metalflat/Log.h"
 
 using mflat::FlatIndex;
+using mflat::GraphIndex;
 using mflat::IvfIndex;
 using mflat::IvfPqIndex;
 using mflat::Metric;
@@ -66,10 +68,12 @@ struct mflat_ivf_index   { IvfIndex    idx; std::mutex mu;
     mflat_ivf_index(int d, Metric m, int nl) : idx(d, m, nl) {} };
 struct mflat_ivfpq_index { IvfPqIndex  idx; std::mutex mu;
     mflat_ivfpq_index(int d, Metric m, int nl, int sub) : idx(d, m, nl, sub) {} };
+struct mflat_graph_index { GraphIndex  idx; std::mutex mu;
+    mflat_graph_index(int d, Metric m, int r) : idx(d, m, r) {} };
 
 extern "C" {
 
-const char* mflat_version(void) { return "0.1.0"; }
+const char* mflat_version(void) { return "0.2.0"; }
 int         mflat_max_k(void)   { return MFLAT_MAX_K; }
 
 void mflat_set_log_handler(mflat_log_handler_t h, void* user) {
@@ -91,6 +95,7 @@ const char* mflat_status_str(mflat_status_t s) {
         case MFLAT_ERR_ALLOC:     return "allocation failed";
         case MFLAT_ERR_NOT_READY: return "index not built";
         case MFLAT_ERR_INTERNAL:  return "internal error";
+        case MFLAT_ERR_IO:        return "file i/o failed";
     }
     return "unknown";
 }
@@ -192,6 +197,67 @@ mflat_status_t mflat_ivfpq_search(mflat_ivfpq_index_t* h, const float* q, int m,
     if (m < 0 || k < 1 || nprobe < 1 || rerank < 0) return MFLAT_ERR_BAD_ARG;
     if (!h->idx.ready()) return MFLAT_ERR_NOT_READY;
     try { std::lock_guard<std::mutex> lk(h->mu); return emit(h->idx.search(q, m, k, nprobe, rerank), m, oi, od, ok); }
+    catch (const std::bad_alloc&) { return MFLAT_ERR_ALLOC; }
+    catch (...)                   { return MFLAT_ERR_INTERNAL; }
+}
+
+/* ---------------- GraphIndex ------------------------------------------ */
+mflat_graph_index_t* mflat_graph_create(int dim, mflat_metric_t metric, int R,
+                                        mflat_status_t* st) {
+    if (dim <= 0) { if (st) *st = MFLAT_ERR_BAD_ARG; return nullptr; }
+    if (R <= 0) R = 32;                                  /* documented default */
+    if (R + 1 > MFLAT_MAX_K) { if (st) *st = MFLAT_ERR_BAD_ARG; return nullptr; }
+    try { auto* h = new mflat_graph_index(dim, conv(metric), R); if (st) *st = MFLAT_OK; return h; }
+    catch (const std::bad_alloc&) { if (st) *st = MFLAT_ERR_ALLOC; return nullptr; }
+    catch (...)                   { if (st) *st = MFLAT_ERR_INTERNAL; return nullptr; }
+}
+void mflat_graph_free(mflat_graph_index_t* h) { delete h; }
+int  mflat_graph_ready (const mflat_graph_index_t* h) { return (h && h->idx.ready()) ? 1 : 0; }
+int  mflat_graph_size  (const mflat_graph_index_t* h) { return h ? h->idx.size()   : 0; }
+int  mflat_graph_dim   (const mflat_graph_index_t* h) { return h ? h->idx.dim()    : 0; }
+int  mflat_graph_degree(const mflat_graph_index_t* h) { return h ? h->idx.degree() : 0; }
+
+mflat_status_t mflat_graph_build(mflat_graph_index_t* h, const float* v, int n, int nprobe) {
+    if (!h || !v) return MFLAT_ERR_NULL_ARG;
+    if (n <= 0)   return MFLAT_ERR_BAD_ARG;
+    if (nprobe <= 0) nprobe = 64;                        /* documented default */
+    try { std::lock_guard<std::mutex> lk(h->mu); h->idx.build(v, n, nprobe); return MFLAT_OK; }
+    catch (const std::bad_alloc&) { return MFLAT_ERR_ALLOC; }
+    catch (...)                   { return MFLAT_ERR_INTERNAL; }
+}
+mflat_status_t mflat_graph_search(mflat_graph_index_t* h, const float* q, int m, int k,
+                                  int L, int max_iter, int num_start, int search_width,
+                                  int32_t* oi, float* od, int* ok) {
+    if (!h || !q) return MFLAT_ERR_NULL_ARG;
+    if (m < 0 || k < 1) return MFLAT_ERR_BAD_ARG;
+    if (!h->idx.ready()) return MFLAT_ERR_NOT_READY;
+    if (L <= 0)         L = 64;                          /* documented defaults */
+    if (max_iter <= 0)  max_iter = -1;
+    if (num_start <= 0) num_start = 32;
+    if (search_width <= 0) search_width = 1;
+    try {
+        std::lock_guard<std::mutex> lk(h->mu);
+        return emit(h->idx.search(q, m, k, L, max_iter, num_start, search_width),
+                    m, oi, od, ok);
+    }
+    catch (const std::bad_alloc&) { return MFLAT_ERR_ALLOC; }
+    catch (...)                   { return MFLAT_ERR_INTERNAL; }
+}
+mflat_status_t mflat_graph_save(const mflat_graph_index_t* h, const char* path) {
+    if (!h || !path) return MFLAT_ERR_NULL_ARG;
+    if (!h->idx.ready()) return MFLAT_ERR_NOT_READY;
+    try {
+        std::lock_guard<std::mutex> lk(const_cast<mflat_graph_index_t*>(h)->mu);
+        return h->idx.save(path) ? MFLAT_OK : MFLAT_ERR_IO;
+    }
+    catch (...) { return MFLAT_ERR_INTERNAL; }
+}
+mflat_status_t mflat_graph_load(mflat_graph_index_t* h, const char* path) {
+    if (!h || !path) return MFLAT_ERR_NULL_ARG;
+    try {
+        std::lock_guard<std::mutex> lk(h->mu);
+        return h->idx.load(path) ? MFLAT_OK : MFLAT_ERR_IO;
+    }
     catch (const std::bad_alloc&) { return MFLAT_ERR_ALLOC; }
     catch (...)                   { return MFLAT_ERR_INTERNAL; }
 }

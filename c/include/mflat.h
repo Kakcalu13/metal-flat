@@ -1,15 +1,17 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* mflat.h — stable C ABI for metal-flat.
  *
- * One C boundary over the C++ engine (FlatIndex / IvfIndex / IvfPqIndex) so any
- * language (Python, Swift, Rust, ...) can drive it. Opaque handles, caller-owned
- * output buffers, explicit status codes; SemVer, additive-only.
+ * One C boundary over the C++ engine (FlatIndex / IvfIndex / IvfPqIndex /
+ * GraphIndex) so any language (Python, Swift, Rust, ...) can drive it. Opaque
+ * handles, caller-owned output buffers, explicit status codes; SemVer,
+ * additive-only.
  *
  * Buffer contract for every *_search: out_ids and out_distances are caller-
  * allocated and must each hold at least m * k elements, row-major (row r, col j
  * at r*k + j), nearest-first. *out_k_used (nullable) receives how many columns
- * per row were actually written (the GPU exact path caps k at MFLAT_MAX_K; the
- * IVF/IVFPQ exact-CPU path serves k > MFLAT_MAX_K). ids are -1 padded.
+ * per row were actually written (FlatIndex serves any k; the IVF/IVFPQ GPU
+ * paths cap k at MFLAT_MAX_K and serve larger k on the exact-CPU path; the
+ * graph index caps k at MFLAT_MAX_K). ids are -1 padded.
  *
  * Apple Silicon only; without a Metal device the engine falls back to exact CPU.
  */
@@ -29,7 +31,7 @@ extern "C" {
 #endif
 
 #define MFLAT_VERSION_MAJOR 0
-#define MFLAT_VERSION_MINOR 1
+#define MFLAT_VERSION_MINOR 2
 #define MFLAT_VERSION_PATCH 0
 #define MFLAT_MAX_K 64          /* GPU per-thread top-k limit; mirrors kMaxK */
 
@@ -44,11 +46,12 @@ typedef enum {
     MFLAT_ERR_NULL_ARG  = 1,    /* a required pointer was NULL                 */
     MFLAT_ERR_BAD_ARG   = 2,    /* dim/n/m/k/nlist/m_sub/metric out of range   */
     MFLAT_ERR_ALLOC     = 3,    /* host allocation / std::bad_alloc            */
-    MFLAT_ERR_NOT_READY = 4,    /* IVF/IVFPQ searched before build()           */
-    MFLAT_ERR_INTERNAL  = 5     /* unexpected C++ exception                    */
+    MFLAT_ERR_NOT_READY = 4,    /* IVF/IVFPQ/graph searched before build()     */
+    MFLAT_ERR_INTERNAL  = 5,    /* unexpected C++ exception                    */
+    MFLAT_ERR_IO        = 6     /* graph save/load file error (v0.2+)          */
 } mflat_status_t;
 
-MFLAT_API const char* mflat_version(void);             /* "0.1.0"             */
+MFLAT_API const char* mflat_version(void);             /* "0.2.0"             */
 MFLAT_API const char* mflat_status_str(mflat_status_t);/* static; do not free */
 MFLAT_API int         mflat_max_k(void);               /* MFLAT_MAX_K         */
 
@@ -127,6 +130,37 @@ MFLAT_API mflat_status_t mflat_ivfpq_build(mflat_ivfpq_index_t*, const float* ve
 MFLAT_API mflat_status_t mflat_ivfpq_search(mflat_ivfpq_index_t*, const float* queries,
         int m, int k, int nprobe, int rerank,
         int32_t* out_ids, float* out_distances, int* out_k_used);
+
+/* ---------------- GraphIndex (CAGRA-style graph ANN, v0.2+) ----------- */
+/* High-recall / low-latency regime (what HNSW owns on CPU). Build once    */
+/* (slow: k-NN graph construction), then beam-search on the GPU.           */
+typedef struct mflat_graph_index mflat_graph_index_t;  /* opaque */
+
+/* R = graph out-degree (default 32 when <= 0); R+1 must fit MFLAT_MAX_K.  */
+MFLAT_API mflat_graph_index_t*
+mflat_graph_create(int dim, mflat_metric_t metric, int R, mflat_status_t* out_status);
+MFLAT_API void mflat_graph_free(mflat_graph_index_t*);
+
+MFLAT_API int mflat_graph_ready(const mflat_graph_index_t*);  /* 1 after build/load */
+MFLAT_API int mflat_graph_size  (const mflat_graph_index_t*);
+MFLAT_API int mflat_graph_dim   (const mflat_graph_index_t*);
+MFLAT_API int mflat_graph_degree(const mflat_graph_index_t*); /* R */
+
+/* nprobe = build-quality knob for the internal IVF self-search (<= 0 => 64:
+   higher = better graph, slower build). */
+MFLAT_API mflat_status_t mflat_graph_build(mflat_graph_index_t*, const float* vectors,
+        int n, int nprobe);
+/* Beam search. L = beam width, the recall/speed knob (<= 0 => 64; >= k).
+   max_iter <= 0 => auto. num_start = restart seeds (<= 0 => 32).
+   search_width = nodes expanded per iteration (<= 0 => 1, capped at 16).
+   k is capped at MFLAT_MAX_K (see *out_k_used). */
+MFLAT_API mflat_status_t mflat_graph_search(mflat_graph_index_t*, const float* queries,
+        int m, int k, int L, int max_iter, int num_start, int search_width,
+        int32_t* out_ids, float* out_distances, int* out_k_used);
+
+/* Persist / restore a built graph (the slow build becomes a one-time cost). */
+MFLAT_API mflat_status_t mflat_graph_save(const mflat_graph_index_t*, const char* path);
+MFLAT_API mflat_status_t mflat_graph_load(mflat_graph_index_t*, const char* path);
 
 #ifdef __cplusplus
 }
