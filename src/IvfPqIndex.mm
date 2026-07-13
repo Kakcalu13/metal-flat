@@ -45,6 +45,7 @@
 #include "Log_internal.h"
 #include "PqTrainer.h"
 #include "CoarseQuantizer.h"
+#include "TopkMsl.h"   // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
 #include "Opq.h"
 
 namespace mflat {
@@ -68,86 +69,12 @@ struct PqParams {
     uint32_t qBase;      // first query of this dispatch (device-LUT chunking)
 };
 
-NSString* const kShaderSrc = @R"(
-#include <metal_stdlib>
-using namespace metal;
-
+// kTopkMslSrc (src/TopkMsl.h) is prepended at pipeline-build time: it supplies
+// kMaxK, insertTopk and reduceTopkTg (the simdgroup-first top-k reduction,
+// shared with FlatIndex / IvfIndex).
+NSString* const kShaderBody = @R"(
 struct PqParams { uint dim; uint k; uint nprobe; uint m; uint dsub; uint queryCount; uint residual; uint tgLut; uint qBase; };
-constant uint kMaxK = 64;
 constant uint kKsub = 256;
-
-// ---- top-k reduction helpers (same scheme as FlatIndex's kernels) --------
-// Per-thread lists are ASCENDING over kk = nextPow2(k) slots (index 0 =
-// worst kept; unfilled slots hold -INF/-1). Power-of-two length lets two
-// lists merge via the bitonic trick: c[i] = max(a[i], b[kk-1-i]) holds the
-// kk largest of the union and is bitonic, so a log2(kk)-stage bitonic merge
-// re-sorts it. Reduction = simdgroup shuffle butterfly (register-level, no
-// scratch) + a cross-simdgroup tree merge over only (tgs/32) lists — so k
-// no longer constrains the threadgroup size (the old tgs*k tree-merge
-// scratch forced tgs=32 at k=64, leaving the GPU ~90% idle).
-
-inline void insertTopk(thread float* s, thread int* id, uint kk, float sc, int gid) {
-    uint pos = 0;
-    while (pos + 1u < kk && sc > s[pos + 1u]) {
-        s[pos] = s[pos + 1u];
-        id[pos] = id[pos + 1u];
-        ++pos;
-    }
-    s[pos] = sc;
-    id[pos] = gid;
-}
-
-inline void simdMergeTopk(thread float* s, thread int* id, uint kk, uint off) {
-    float ns[kMaxK];
-    int   ni[kMaxK];
-    for (uint i = 0; i < kk; ++i) {
-        const float os = simd_shuffle_xor(s[kk - 1u - i], off);
-        const int   oi = simd_shuffle_xor(id[kk - 1u - i], off);
-        if (os > s[i]) { ns[i] = os;   ni[i] = oi; }
-        else           { ns[i] = s[i]; ni[i] = id[i]; }
-    }
-    for (uint i = 0; i < kk; ++i) { s[i] = ns[i]; id[i] = ni[i]; }
-    for (uint st = kk >> 1; st > 0u; st >>= 1)
-        for (uint i = 0; i < kk; ++i) {
-            const uint j = i | st;
-            if ((i & st) == 0u && j < kk && s[i] > s[j]) {
-                const float ts = s[i]; s[i] = s[j]; s[j] = ts;
-                const int   ti = id[i]; id[i] = id[j]; id[j] = ti;
-            }
-        }
-}
-
-inline void mergeListsTg(threadgroup float* aS, threadgroup int* aI,
-                         threadgroup float* bS, threadgroup int* bI, uint kk) {
-    float mS[kMaxK];
-    int   mI[kMaxK];
-    int ia = (int)kk - 1, ib = (int)kk - 1;
-    for (int o = (int)kk - 1; o >= 0; --o) {
-        const float av = (ia >= 0) ? aS[ia] : -INFINITY;
-        const float bv = (ib >= 0) ? bS[ib] : -INFINITY;
-        if (av >= bv) { mS[o] = av; mI[o] = (ia >= 0) ? aI[ia] : -1; --ia; }
-        else          { mS[o] = bv; mI[o] = (ib >= 0) ? bI[ib] : -1; --ib; }
-    }
-    for (uint i = 0; i < kk; ++i) { aS[i] = mS[i]; aI[i] = mI[i]; }
-}
-
-inline void reduceTopkTg(thread float* s, thread int* id, uint kk,
-                         threadgroup float* redScore, threadgroup int* redId,
-                         uint tid, uint tgs, uint sgid, uint lane) {
-    for (uint off = 1u; off < 32u; off <<= 1) simdMergeTopk(s, id, kk, off);
-    if (lane == 0u)
-        for (uint i = 0; i < kk; ++i) {
-            redScore[sgid * kk + i] = s[i];
-            redId[sgid * kk + i]    = id[i];
-        }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint off = (tgs >> 5) >> 1; off > 0u; off >>= 1) {
-        if (tid < off)
-            mergeListsTg(redScore + tid * kk, redId + tid * kk,
-                         redScore + (tid + off) * kk, redId + (tid + off) * kk, kk);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
 
 // ---- ADC candidate distance ----------------------------------------------
 // M table lookups (+ the per-cell residual table when res). Word-vectorized
@@ -383,7 +310,8 @@ IvfPqIndex::IvfPqIndex(int dim, Metric metric, int nlist, int m)
     if (mImpl->device) {
         mImpl->queue = [mImpl->device newCommandQueue];
         NSError* err = nil;
-        id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kShaderSrc options:nil error:&err];
+        NSString* src = [detail::kTopkMslSrc stringByAppendingString:kShaderBody];
+        id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:src options:nil error:&err];
         if (!lib) {
             MFLAT_LOG_ERROR("ivfpq shader compile failed: %s",
                             err ? [[err localizedDescription] UTF8String] : "?");
@@ -531,32 +459,60 @@ void searchCpu(int dim, const CoarseQuantizer& cq,
     const std::vector<float>& cent         = cq.centroids();
     parallelFor(m, [&](int qi) {
         const float* q = qPtr + static_cast<size_t>(qi) * dim;
-        std::vector<float> lut(static_cast<size_t>(pq.lutSize()));
+        const size_t lutN = static_cast<size_t>(pq.lutSize());
+        std::vector<float> lut(lutN);
         pq.buildAdcTable(q, lut.data());
+        std::vector<float> comb(residual ? lutN : 0);   // lut + per-cell table
         std::vector<int> cells(nprobe);
         cq.probeCellsCpu(q, nprobe, cells.data());
         std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
         std::vector<int>   bestId(k, -1);
         for (int pp = 0; pp < nprobe; ++pp) {
             const int c = cells[pp];
+            const int lo = cellStart[c], hi = cellStart[c + 1];
             // Residual terms: exact fp32 coarse ||q-c||^2 + the per-cell table.
-            const float base = residual
-                ? sqL2(q, &cent[static_cast<size_t>(c) * dim], dim) : 0.0f;
-            const float* Tc = residual
-                ? &precomp[static_cast<size_t>(c) * M * ksub] : nullptr;
-            for (int j = cellStart[c]; j < cellStart[c + 1]; ++j) {
+            // Folding the per-cell table into the query LUT once per cell
+            // (M*ksub adds) halves the random loads in the hot loop; only
+            // worth it when the cell has enough codes to amortize.
+            float base = 0.0f;
+            const float* T = lut.data();
+            if (residual) {
+                base = sqL2(q, &cent[static_cast<size_t>(c) * dim], dim);
+                const float* Tc = &precomp[static_cast<size_t>(c) * M * ksub];
+                if (static_cast<size_t>(hi - lo) * M >= 2 * lutN) {
+                    for (size_t e = 0; e < lutN; ++e) comb[e] = lut[e] + Tc[e];
+                    T = comb.data();
+                    Tc = nullptr;
+                }
+                if (Tc) {   // small cell: classic two-table loop
+                    for (int j = lo; j < hi; ++j) {
+                        const uint8_t* code = &reorderedCodes[static_cast<size_t>(j) * M];
+                        float dist = base;
+                        for (int mm = 0; mm < M; ++mm) {
+                            const int cd = code[mm];
+                            dist += lut[static_cast<size_t>(mm) * ksub + cd]
+                                  + Tc[static_cast<size_t>(mm) * ksub + cd];
+                        }
+                        const float s = -dist;
+                        if (s > bestScore[0]) {
+                            int pos = 0;
+                            while (pos + 1 < k && s > bestScore[pos + 1]) {
+                                bestScore[pos] = bestScore[pos + 1];
+                                bestId[pos]    = bestId[pos + 1];
+                                ++pos;
+                            }
+                            bestScore[pos] = s;
+                            bestId[pos]    = reorderedIds[j];
+                        }
+                    }
+                    continue;
+                }
+            }
+            for (int j = lo; j < hi; ++j) {
                 const uint8_t* code = &reorderedCodes[static_cast<size_t>(j) * M];
                 float dist = base;
-                if (residual) {
-                    for (int mm = 0; mm < M; ++mm) {
-                        const int cd = code[mm];
-                        dist += lut[static_cast<size_t>(mm) * ksub + cd]
-                              + Tc[static_cast<size_t>(mm) * ksub + cd];
-                    }
-                } else {
-                    for (int mm = 0; mm < M; ++mm)
-                        dist += lut[static_cast<size_t>(mm) * ksub + code[mm]];
-                }
+                for (int mm = 0; mm < M; ++mm)
+                    dist += T[static_cast<size_t>(mm) * ksub + code[mm]];
                 const float s = -dist;
                 if (s > bestScore[0]) {
                     int pos = 0;
@@ -638,10 +594,10 @@ void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
         // (simdgroup-first merge), so k no longer constrains tg — always run
         // the widest power-of-two group (the old tgs*k scratch forced tg=32
         // at k=64, measured 5-15x SLOWER than the CPU path).
-        uint32_t kkP = 1; while (kkP < (uint32_t)kRun) kkP <<= 1;
+        const uint32_t kkP = detail::nextPow2K(kRun);
         NSUInteger tg = std::min<NSUInteger>(adcPipe.maxTotalThreadsPerThreadgroup, 256);
         { NSUInteger pw = 32; while (pw * 2 <= tg) pw *= 2; tg = pw; }
-        const NSUInteger scratch  = (((tg / 32) * kkP * 4) + 15) & ~NSUInteger(15);
+        const NSUInteger scratch  = detail::topkScratchBytes(tg, kkP);
         const NSUInteger lutBytes = ((static_cast<NSUInteger>(this->m) * kKsub * sizeof(float)) + 15) & ~NSUInteger(15);
         const bool tgLut = lutBytes + 2 * scratch + 32 <= [device maxThreadgroupMemoryLength];
 
