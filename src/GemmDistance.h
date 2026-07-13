@@ -29,6 +29,9 @@ public:
     // that row — the hook that lets FlatIndex tile over the database
     // without copying (the block is addressed in place via a buffer
     // offset), so the full m×N score matrix is never materialized.
+    // (A transposed D·Qᵀ variant for "coalesced" serial selection was
+    // measured strictly slower on M2 — per-thread unit-stride streams
+    // already saturate; experiment deleted, don't re-add.)
     void encode(id<MTLCommandBuffer> cb,
                 id<MTLBuffer> queries, int m,
                 id<MTLBuffer> db, int dbRowOffset, int n, int d,
