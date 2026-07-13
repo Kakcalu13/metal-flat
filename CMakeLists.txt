@@ -44,5 +44,5 @@ if(MFLAT_BUILD_C_API)
     set_target_properties(metalflat_c PROPERTIES
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
-        VERSION 0.1.0 SOVERSION 0)
+        VERSION 0.2.0 SOVERSION 0)
 endif()
