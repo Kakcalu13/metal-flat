@@ -14,8 +14,13 @@
 //            2 q_m·pqc[m][j], i.e. ||q_m - pqc[m][j]||^2 up to the per-query
 //            constant ||q_m||^2). Because we PQ the vector (not a per-cell
 //            residual), this LUT is cell-independent -> built ONCE per query.
-//            Then each candidate's distance is m table lookups + adds; keep
-//            top-k; tree-merge across the threadgroup.
+//            The LUT lives in threadgroup memory when it fits, else in a
+//            device scratch (large m_sub). Each candidate's distance is m
+//            table lookups + adds (word-vectorized when m % 4 == 0); per-
+//            thread register top-k, then a simdgroup-shuffle + tree
+//            reduction (scratch is (tgs/32)*kk entries, so k never crushes
+//            the threadgroup size). kRun > 16 routes to the multithreaded
+//            CPU ADC, which is measured faster there.
 //
 // k-means uses FlatIndex for the assignment step (GEMM on GPU, exact CPU
 // fallback when no device), so build works with or without Metal. The fine
@@ -59,19 +64,149 @@ struct PqParams {
     uint32_t dsub;
     uint32_t queryCount;
     uint32_t residual;   // 1 = residual ADC (precomp + coarse terms active)
+    uint32_t tgLut;      // 1 = LUT in threadgroup memory, 0 = device scratch
+    uint32_t qBase;      // first query of this dispatch (device-LUT chunking)
 };
 
 NSString* const kShaderSrc = @R"(
 #include <metal_stdlib>
 using namespace metal;
 
-struct PqParams { uint dim; uint k; uint nprobe; uint m; uint dsub; uint queryCount; uint residual; };
+struct PqParams { uint dim; uint k; uint nprobe; uint m; uint dsub; uint queryCount; uint residual; uint tgLut; uint qBase; };
 constant uint kMaxK = 64;
 constant uint kKsub = 256;
 
+// ---- top-k reduction helpers (same scheme as FlatIndex's kernels) --------
+// Per-thread lists are ASCENDING over kk = nextPow2(k) slots (index 0 =
+// worst kept; unfilled slots hold -INF/-1). Power-of-two length lets two
+// lists merge via the bitonic trick: c[i] = max(a[i], b[kk-1-i]) holds the
+// kk largest of the union and is bitonic, so a log2(kk)-stage bitonic merge
+// re-sorts it. Reduction = simdgroup shuffle butterfly (register-level, no
+// scratch) + a cross-simdgroup tree merge over only (tgs/32) lists — so k
+// no longer constrains the threadgroup size (the old tgs*k tree-merge
+// scratch forced tgs=32 at k=64, leaving the GPU ~90% idle).
+
+inline void insertTopk(thread float* s, thread int* id, uint kk, float sc, int gid) {
+    uint pos = 0;
+    while (pos + 1u < kk && sc > s[pos + 1u]) {
+        s[pos] = s[pos + 1u];
+        id[pos] = id[pos + 1u];
+        ++pos;
+    }
+    s[pos] = sc;
+    id[pos] = gid;
+}
+
+inline void simdMergeTopk(thread float* s, thread int* id, uint kk, uint off) {
+    float ns[kMaxK];
+    int   ni[kMaxK];
+    for (uint i = 0; i < kk; ++i) {
+        const float os = simd_shuffle_xor(s[kk - 1u - i], off);
+        const int   oi = simd_shuffle_xor(id[kk - 1u - i], off);
+        if (os > s[i]) { ns[i] = os;   ni[i] = oi; }
+        else           { ns[i] = s[i]; ni[i] = id[i]; }
+    }
+    for (uint i = 0; i < kk; ++i) { s[i] = ns[i]; id[i] = ni[i]; }
+    for (uint st = kk >> 1; st > 0u; st >>= 1)
+        for (uint i = 0; i < kk; ++i) {
+            const uint j = i | st;
+            if ((i & st) == 0u && j < kk && s[i] > s[j]) {
+                const float ts = s[i]; s[i] = s[j]; s[j] = ts;
+                const int   ti = id[i]; id[i] = id[j]; id[j] = ti;
+            }
+        }
+}
+
+inline void mergeListsTg(threadgroup float* aS, threadgroup int* aI,
+                         threadgroup float* bS, threadgroup int* bI, uint kk) {
+    float mS[kMaxK];
+    int   mI[kMaxK];
+    int ia = (int)kk - 1, ib = (int)kk - 1;
+    for (int o = (int)kk - 1; o >= 0; --o) {
+        const float av = (ia >= 0) ? aS[ia] : -INFINITY;
+        const float bv = (ib >= 0) ? bS[ib] : -INFINITY;
+        if (av >= bv) { mS[o] = av; mI[o] = (ia >= 0) ? aI[ia] : -1; --ia; }
+        else          { mS[o] = bv; mI[o] = (ib >= 0) ? bI[ib] : -1; --ib; }
+    }
+    for (uint i = 0; i < kk; ++i) { aS[i] = mS[i]; aI[i] = mI[i]; }
+}
+
+inline void reduceTopkTg(thread float* s, thread int* id, uint kk,
+                         threadgroup float* redScore, threadgroup int* redId,
+                         uint tid, uint tgs, uint sgid, uint lane) {
+    for (uint off = 1u; off < 32u; off <<= 1) simdMergeTopk(s, id, kk, off);
+    if (lane == 0u)
+        for (uint i = 0; i < kk; ++i) {
+            redScore[sgid * kk + i] = s[i];
+            redId[sgid * kk + i]    = id[i];
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = (tgs >> 5) >> 1; off > 0u; off >>= 1) {
+        if (tid < off)
+            mergeListsTg(redScore + tid * kk, redId + tid * kk,
+                         redScore + (tid + off) * kk, redId + (tid + off) * kk, kk);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---- ADC candidate distance ----------------------------------------------
+// M table lookups (+ the per-cell residual table when res). Word-vectorized
+// when M % 4 == 0 (each code row is then 4-byte aligned: row stride M).
+// Two variants because the LUT may live in threadgroup or device memory.
+inline float adcDistTg(device const uchar* code, uint M, bool res,
+                       threadgroup const float* lut, device const float* pc,
+                       float base) {
+    float dist = base;
+    if ((M & 3u) == 0u) {
+        device const uint* w = (device const uint*)code;
+        for (uint i = 0; i < (M >> 2); ++i) {
+            const uint c4 = w[i];
+            const uint o  = (i << 2) * kKsub;
+            const uint b0 = o + (c4 & 0xffu);
+            const uint b1 = o + kKsub + ((c4 >> 8) & 0xffu);
+            const uint b2 = o + 2u * kKsub + ((c4 >> 16) & 0xffu);
+            const uint b3 = o + 3u * kKsub + (c4 >> 24);
+            dist += lut[b0] + lut[b1] + lut[b2] + lut[b3];
+            if (res) dist += pc[b0] + pc[b1] + pc[b2] + pc[b3];
+        }
+    } else {
+        for (uint mm = 0; mm < M; ++mm) {
+            const uint o = mm * kKsub + code[mm];
+            dist += lut[o];
+            if (res) dist += pc[o];
+        }
+    }
+    return dist;
+}
+inline float adcDistDev(device const uchar* code, uint M, bool res,
+                        device const float* lut, device const float* pc,
+                        float base) {
+    float dist = base;
+    if ((M & 3u) == 0u) {
+        device const uint* w = (device const uint*)code;
+        for (uint i = 0; i < (M >> 2); ++i) {
+            const uint c4 = w[i];
+            const uint o  = (i << 2) * kKsub;
+            const uint b0 = o + (c4 & 0xffu);
+            const uint b1 = o + kKsub + ((c4 >> 8) & 0xffu);
+            const uint b2 = o + 2u * kKsub + ((c4 >> 16) & 0xffu);
+            const uint b3 = o + 3u * kKsub + (c4 >> 24);
+            dist += lut[b0] + lut[b1] + lut[b2] + lut[b3];
+            if (res) dist += pc[b0] + pc[b1] + pc[b2] + pc[b3];
+        }
+    } else {
+        for (uint mm = 0; mm < M; ++mm) {
+            const uint o = mm * kKsub + code[mm];
+            dist += lut[o];
+            if (res) dist += pc[o];
+        }
+    }
+    return dist;
+}
+
 // One threadgroup per query. Build the per-query ADC table once, then scan
 // the probed cells' codes by table lookup, keeping a top-k per thread, then
-// tree-merge. Distances rank by score = -dist (larger = nearer).
+// reduce. Distances rank by score = -dist (larger = nearer).
 //
 // Non-residual: dist = sum_mm lut[mm][code], lut = ||pqc||^2 - 2 q·pqc
 //               (cell-independent; reported value adds ||q||^2).
@@ -80,6 +215,11 @@ constant uint kKsub = 256;
 //               classic decomposition that keeps the query LUT byte-identical
 //               to the non-residual one (built once per query, not per probe).
 //               ||q-c||^2 comes from the host in exact fp32 (coarseVals).
+//
+// LUT placement: threadgroup memory when it fits next to the reduction
+// scratch (p.tgLut). Larger code sizes (m_sub >= ~28) spill the LUT to a
+// per-dispatch device scratch (lutSpill, one lutN slice per threadgroup);
+// the host then chunks the query batch so the scratch stays bounded.
 kernel void ivfpq_adc(
     device const uchar* codes      [[buffer(0)]],   // dbCount × m
     device const int*   ids        [[buffer(1)]],   // dbCount
@@ -93,36 +233,46 @@ kernel void ivfpq_adc(
     constant PqParams&  p          [[buffer(9)]],
     device const float* precomp    [[buffer(10)]],  // nlist × m × 256 (residual)
     device const float* coarseVals [[buffer(11)]],  // queryCount × nprobe (residual)
-    threadgroup float*  lut        [[threadgroup(0)]],   // m × 256
-    threadgroup float*  redScore   [[threadgroup(1)]],   // tgs × k
-    threadgroup int*    redId      [[threadgroup(2)]],   // tgs × k
-    uint qi  [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]])
+    device float*       lutSpill   [[buffer(12)]],  // chunk × m × 256 (device-LUT mode)
+    threadgroup float*  lutTg      [[threadgroup(0)]],   // m × 256 (tgLut mode)
+    threadgroup float*  redScore   [[threadgroup(1)]],   // (tgs/32) × kk
+    threadgroup int*    redId      [[threadgroup(2)]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint tid   [[thread_position_in_threadgroup]],
+    uint tgs   [[threads_per_threadgroup]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]])
 {
+    const uint qi = p.qBase + tgpos;
     if (qi >= p.queryCount) return;
     const uint M = p.m, dsub = p.dsub, dim = p.dim;
     const uint k = min(p.k, kMaxK);
-    const bool res = (p.residual != 0u);
+    uint kk = 1; while (kk < k) kk <<= 1;
+    const bool res   = (p.residual != 0u);
+    const bool useTg = (p.tgLut != 0u);
     device const float* q = queries + (uint64_t)qi * dim;
 
     // Per-query LUT (cell-independent and BYTE-IDENTICAL in both modes):
     // lut[mm*256 + j] = ||pqc[mm][j]||^2 - 2 q_mm·pqc[mm][j].
     const uint lutN = M * kKsub;
+    device float* dl = lutSpill + (uint64_t)tgpos * lutN;   // only touched if !useTg
     for (uint e = tid; e < lutN; e += tgs) {
         const uint mm = e / kKsub;
         const uint j  = e % kKsub;
         device const float* sub = pqc + ((uint64_t)mm * kKsub + j) * dsub;
         device const float* qm  = q + (uint64_t)mm * dsub;
-        float dot = 0.0;
+        float dot = 0.0f;
         for (uint d = 0; d < dsub; ++d) dot += qm[d] * sub[d];
-        lut[e] = pqNorm[e] - 2.0 * dot;
+        const float v = pqNorm[e] - 2.0f * dot;
+        if (useTg) lutTg[e] = v; else dl[e] = v;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (useTg) threadgroup_barrier(mem_flags::mem_threadgroup);
+    else       threadgroup_barrier(mem_flags::mem_device);
 
     float bestScore[kMaxK];
     int   bestId[kMaxK];
-    for (uint i = 0; i < k; ++i) { bestScore[i] = -INFINITY; bestId[i] = -1; }
+    for (uint i = 0; i < kk; ++i) { bestScore[i] = -INFINITY; bestId[i] = -1; }
+    float worst = -INFINITY;
 
     device const int* myCells = probed + (uint64_t)qi * p.nprobe;
     for (uint pp = 0; pp < p.nprobe; ++pp) {
@@ -132,64 +282,38 @@ kernel void ivfpq_adc(
         const int hi = cellStart[cell + 1];
         device const float* pc = precomp + (uint64_t)cell * M * kKsub;
         const float base = res ? coarseVals[(uint64_t)qi * p.nprobe + pp] : 0.0f;
-        for (int c = lo + (int)tid; c < hi; c += (int)tgs) {
-            device const uchar* code = codes + (uint64_t)c * M;
-            float dist = base;
-            if (res) {
-                for (uint mm = 0; mm < M; ++mm) {
-                    const uint cd = code[mm];
-                    dist += pc[mm * kKsub + cd] + lut[mm * kKsub + cd];
+        if (useTg) {
+            for (int c = lo + (int)tid; c < hi; c += (int)tgs) {
+                const float score = -adcDistTg(codes + (uint64_t)c * M, M, res,
+                                               lutTg, pc, base);
+                if (score > worst) {
+                    insertTopk(bestScore, bestId, kk, score, ids[c]);
+                    worst = bestScore[0];
                 }
-            } else {
-                for (uint mm = 0; mm < M; ++mm) dist += lut[mm * kKsub + code[mm]];
             }
-            const float score = -dist;
-            if (score > bestScore[0]) {
-                uint pos = 0;
-                while (pos + 1u < k && score > bestScore[pos + 1u]) {
-                    bestScore[pos] = bestScore[pos + 1u];
-                    bestId[pos]    = bestId[pos + 1u];
-                    ++pos;
+        } else {
+            for (int c = lo + (int)tid; c < hi; c += (int)tgs) {
+                const float score = -adcDistDev(codes + (uint64_t)c * M, M, res,
+                                                dl, pc, base);
+                if (score > worst) {
+                    insertTopk(bestScore, bestId, kk, score, ids[c]);
+                    worst = bestScore[0];
                 }
-                bestScore[pos] = score;
-                bestId[pos]    = ids[c];
             }
         }
     }
 
-    for (uint i = 0; i < k; ++i) {
-        redScore[tid * k + i] = bestScore[i];
-        redId[tid * k + i]    = bestId[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint off = tgs >> 1; off > 0u; off >>= 1) {
-        if (tid < off) {
-            threadgroup float* aS = redScore + tid * k;
-            threadgroup int*   aI = redId    + tid * k;
-            threadgroup float* bS = redScore + (tid + off) * k;
-            threadgroup int*   bI = redId    + (tid + off) * k;
-            float mS[kMaxK];
-            int   mI[kMaxK];
-            int ia = (int)k - 1, ib = (int)k - 1;
-            for (int o = (int)k - 1; o >= 0; --o) {
-                const float av = (ia >= 0) ? aS[ia] : -INFINITY;
-                const float bv = (ib >= 0) ? bS[ib] : -INFINITY;
-                if (av >= bv) { mS[o] = av; mI[o] = (ia >= 0) ? aI[ia] : -1; --ia; }
-                else          { mS[o] = bv; mI[o] = (ib >= 0) ? bI[ib] : -1; --ib; }
-            }
-            for (uint i = 0; i < k; ++i) { aS[i] = mS[i]; aI[i] = mI[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    reduceTopkTg(bestScore, bestId, kk, redScore, redId, tid, tgs, sgid, lane);
+
     if (tid == 0u) {
         // Residual dist already IS ~||q-x||^2 (coarse term included); the
         // non-residual LUT omits the per-query ||q||^2 constant, so add it back.
-        float qn = 0.0;
+        float qn = 0.0f;
         if (!res) for (uint d = 0; d < dim; ++d) qn += q[d] * q[d];
         device int*   oi = outIds + (uint64_t)qi * k;
         device float* ov = outVal + (uint64_t)qi * k;
         for (uint i = 0; i < k; ++i) {
-            uint src = k - 1u - i;
+            uint src = kk - 1u - i;
             oi[i] = redId[src];
             ov[i] = -redScore[src] + qn;
         }
@@ -510,6 +634,31 @@ void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
         p.m = (uint32_t)this->m; p.dsub = (uint32_t)dsub; p.queryCount = (uint32_t)m;
         p.residual = residualActive ? 1u : 0u;
 
+        // Threadgroup sizing: the reduction scratch is (tg/32) * kk entries
+        // (simdgroup-first merge), so k no longer constrains tg — always run
+        // the widest power-of-two group (the old tgs*k scratch forced tg=32
+        // at k=64, measured 5-15x SLOWER than the CPU path).
+        uint32_t kkP = 1; while (kkP < (uint32_t)kRun) kkP <<= 1;
+        NSUInteger tg = std::min<NSUInteger>(adcPipe.maxTotalThreadsPerThreadgroup, 256);
+        { NSUInteger pw = 32; while (pw * 2 <= tg) pw *= 2; tg = pw; }
+        const NSUInteger scratch  = (((tg / 32) * kkP * 4) + 15) & ~NSUInteger(15);
+        const NSUInteger lutBytes = ((static_cast<NSUInteger>(this->m) * kKsub * sizeof(float)) + 15) & ~NSUInteger(15);
+        const bool tgLut = lutBytes + 2 * scratch + 32 <= [device maxThreadgroupMemoryLength];
+
+        // LUT spill (m_sub too large for threadgroup memory): per-dispatch
+        // device scratch, batch chunked so the scratch stays <= ~64 MB.
+        int chunk = m;
+        id<MTLBuffer> lutSpill = pqnBuf;   // dummy binding in tgLut mode (never touched)
+        if (!tgLut) {
+            const size_t lutFloats = static_cast<size_t>(this->m) * kKsub;
+            chunk = static_cast<int>(std::max<size_t>(
+                1, (64ull << 20) / (lutFloats * sizeof(float))));
+            chunk = std::min(chunk, m);
+            lutSpill = [device newBufferWithLength:static_cast<size_t>(chunk) * lutFloats * sizeof(float)
+                                           options:MTLResourceStorageModePrivate];
+        }
+        p.tgLut = tgLut ? 1u : 0u;
+
         id<MTLCommandBuffer>         cb  = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:adcPipe];
@@ -522,24 +671,20 @@ void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
         [enc setBuffer:pqnBuf   offset:0 atIndex:6];
         [enc setBuffer:outIdBuf offset:0 atIndex:7];
         [enc setBuffer:outValBuf offset:0 atIndex:8];
-        [enc setBytes:&p length:sizeof(p) atIndex:9];
         [enc setBuffer:(residualActive ? precompBuf : pqnBuf) offset:0 atIndex:10];
         [enc setBuffer:cvBuf offset:0 atIndex:11];
-
-        const NSUInteger kk  = static_cast<NSUInteger>(kRun);
-        const NSUInteger lutBytes = static_cast<NSUInteger>(this->m) * kKsub * sizeof(float);
-        NSUInteger memTg = (lutBytes + 256 < 32000)
-            ? (32000 - lutBytes - 256) / (kk * (sizeof(float) + sizeof(int)))
-            : 1;
-        NSUInteger tg = std::min<NSUInteger>(adcPipe.maxTotalThreadsPerThreadgroup, 256);
-        tg = std::min<NSUInteger>(tg, std::max<NSUInteger>(memTg, 32));
-        NSUInteger pw = 32; while (pw * 2 <= tg) pw *= 2; tg = pw;
-
-        [enc setThreadgroupMemoryLength:lutBytes atIndex:0];
-        [enc setThreadgroupMemoryLength:tg * kk * sizeof(float) atIndex:1];
-        [enc setThreadgroupMemoryLength:tg * kk * sizeof(int)   atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(m), 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc setBuffer:lutSpill offset:0 atIndex:12];
+        [enc setThreadgroupMemoryLength:(tgLut ? lutBytes : 16) atIndex:0];
+        [enc setThreadgroupMemoryLength:scratch atIndex:1];
+        [enc setThreadgroupMemoryLength:scratch atIndex:2];
+        // Serial encoder: chunk t+1's LUT writes are ordered after chunk t's
+        // reads of the shared spill scratch (single dispatch when tgLut).
+        for (int start = 0; start < m; start += chunk) {
+            p.qBase = static_cast<uint32_t>(start);
+            [enc setBytes:&p length:sizeof(p) atIndex:9];
+            [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(std::min(chunk, m - start)), 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        }
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -584,7 +729,14 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
     pq.ids.assign(static_cast<size_t>(m) * kRun, -1);
     pq.distances.assign(static_cast<size_t>(m) * kRun, std::numeric_limits<float>::infinity());
 
-    const bool useGpu = mImpl->adcPipe && mImpl->cq->gpuReady() && kRun <= kMaxK;
+    // GPU-vs-CPU routing: the GPU ADC wins at kRun <= 16; above that the
+    // per-thread top-k reduction cost grows with nextPow2(kRun) and the
+    // multithreaded CPU ADC is measured 1.2-3x faster (M2 Pro,
+    // temp/pq_shapes.mm; kRun > kMaxK has no GPU path at all).
+    // MFLAT_PQ_CPU=1/0 forces the CPU/GPU path.
+    bool cpuRoute = (kRun > 16);
+    if (const char* e = std::getenv("MFLAT_PQ_CPU")) cpuRoute = (e[0] == '1');
+    const bool useGpu = !cpuRoute && mImpl->adcPipe && mImpl->cq->gpuReady() && kRun <= kMaxK;
     if (useGpu) {
         mImpl->runPqGpu(qPtr, m, kRun, nprobe, pq);
     } else {
