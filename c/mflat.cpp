@@ -178,6 +178,12 @@ void mflat_ivfpq_free(mflat_ivfpq_index_t* h) { delete h; }
 void mflat_ivfpq_set_rerank(mflat_ivfpq_index_t* h, int enable) {
     if (h) { std::lock_guard<std::mutex> lk(h->mu); h->idx.setRerank(enable != 0); }
 }
+void mflat_ivfpq_set_residual(mflat_ivfpq_index_t* h, int enable) {
+    if (h) { std::lock_guard<std::mutex> lk(h->mu); h->idx.setResidual(enable != 0); }
+}
+void mflat_ivfpq_set_opq(mflat_ivfpq_index_t* h, int enable) {
+    if (h) { std::lock_guard<std::mutex> lk(h->mu); h->idx.setOpq(enable != 0); }
+}
 int mflat_ivfpq_ready(const mflat_ivfpq_index_t* h) { return (h && h->idx.ready()) ? 1 : 0; }
 int mflat_ivfpq_size (const mflat_ivfpq_index_t* h) { return h ? h->idx.size()  : 0; }
 int mflat_ivfpq_dim  (const mflat_ivfpq_index_t* h) { return h ? h->idx.dim()   : 0; }

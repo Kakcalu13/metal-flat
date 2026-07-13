@@ -118,6 +118,12 @@ MFLAT_API void mflat_ivfpq_free(mflat_ivfpq_index_t*);
 
 /* Enable exact reranking BEFORE build() (keeps full vectors; see search). */
 MFLAT_API void mflat_ivfpq_set_rerank(mflat_ivfpq_index_t*, int enable);
+/* Build-mode knobs, latched at build() (calling after build() affects only a
+   later rebuild). residual (default ON) PQ-encodes x - coarse_centroid;
+   opq (default OFF, v0.2+) learns a rotation that lowers quantization error
+   (slower build, higher recall at the same code size). */
+MFLAT_API void mflat_ivfpq_set_residual(mflat_ivfpq_index_t*, int enable);
+MFLAT_API void mflat_ivfpq_set_opq(mflat_ivfpq_index_t*, int enable);
 
 MFLAT_API int mflat_ivfpq_ready(const mflat_ivfpq_index_t*);  /* 1 after build() */
 MFLAT_API int mflat_ivfpq_size (const mflat_ivfpq_index_t*);
