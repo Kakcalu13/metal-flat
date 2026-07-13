@@ -13,7 +13,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <queue>
 #include <unordered_set>
@@ -224,9 +226,16 @@ struct GraphParams {
     uint32_t dim, k, L, R, Lc, numSeeds, maxIter, metric, queryCount, dbCount, entry, H, W;
 };
 
+// Coarse cells for the kNN self-search. The self-search scans nprobe * (n/nlist)
+// candidates per node, so a FINER partition cuts build cost linearly: at a fixed
+// nprobe, mul=4 quarters the scanned candidates. Graph quality tolerates it —
+// the RNG prune keeps ~10 of the K0 candidates, and the beam search repairs the
+// rest — so this is the build's cheapest lever (MFLAT_GRAPH_NLIST_MUL overrides).
 inline int autoNlist(int n) {
-    int s = static_cast<int>(std::sqrt(static_cast<double>(n)));
-    return std::max(64, s);
+    int mul = 4;
+    if (const char* e = std::getenv("MFLAT_GRAPH_NLIST_MUL")) mul = std::max(1, atoi(e));
+    const int s = static_cast<int>(std::sqrt(static_cast<double>(n))) * mul;
+    return std::max(64, std::min(s, n));
 }
 // splitmix-ish deterministic hash for reproducible random restart seeds (CPU).
 inline uint32_t mix(uint32_t x) {
@@ -314,6 +323,18 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     if (n <= 0 || mImpl->dim <= 0) return;
     const int dim = mImpl->dim, R = mImpl->R;
 
+    // Per-stage build timing (INFO) — build is the index's weak spot, so the
+    // split between the GPU self-search and the CPU graph stages is worth
+    // reporting rather than re-deriving with a profiler each time.
+    using Clock = std::chrono::steady_clock;
+    auto tick = Clock::now();
+    auto lap  = [&tick] {
+        const auto now = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - tick).count();
+        tick = now;
+        return ms;
+    };
+
     mImpl->db.assign(vectors, vectors + static_cast<size_t>(n) * dim);
     if (mImpl->metric == Metric::Cosine) normalizeRows(mImpl->db, n, dim);
     const float* data = mImpl->db.data();
@@ -322,15 +343,28 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     // --- 1. intermediate kNN via IVF self-search (reuse the GPU batched-kNN) --
     // K0 candidates per node, sorted nearest-first. The self-search is the slow
     // step; cache it (MFLAT_KNN_CACHE) so the pruning below can be tuned cheaply.
-    const int K0 = std::min(kMaxK, 64);
+    // K0 candidates per node. Tempting to shrink (RNG pruning keeps only ~11 of
+    // them as forward edges, and the self-search's per-thread top-k is 2*K0
+    // registers, so K0 drives its occupancy) — but MEASURED, K0=32 costs real
+    // recall: 0.904 vs 0.941 @L=32, 0.966 vs 0.984 @L=64 (SIFT 200k, exact
+    // subset GT). The pruner needs the deep candidate list even though it keeps
+    // few. Cut build cost via the coarse partition instead (see autoNlist).
+    // MFLAT_GRAPH_K0 overrides.
+    int K0 = kMaxK;
+    if (const char* e = std::getenv("MFLAT_GRAPH_K0")) K0 = atoi(e);
+    K0 = std::max(8, std::min(K0, kMaxK));
     std::vector<int32_t> knn;
     const char* kc = std::getenv("MFLAT_KNN_CACHE");
     if (!(kc && loadKnn(kc, knn, n, K0))) {
         IvfIndex ivf(dim, metric, autoNlist(n));
         ivf.build(data, n);
+        const double bms = lap();
         knn = ivf.search(data, n, K0, nprobe).ids;    // N × K0, sorted by distance
+        MFLAT_LOG_INFO("graph build: ivf train %.0f ms, knn self-search %.0f ms "
+                       "(n=%d K0=%d nprobe=%d)", bms, lap(), n, K0, nprobe);
         if (kc) saveKnn(kc, knn, n, K0);
     }
+    tick = Clock::now();
 
     // --- 2. rank-based RNG pruning (CAGRA/NSG) → diverse forward edges --------
     // Keep candidate b (nearest-first) only if no already-kept neighbour c is
@@ -360,10 +394,11 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     });
 
     {   // forward-degree diagnostic
+        const double pms = lap();
         long tot = 0; int mn = R, mx = 0;
         for (int i = 0; i < n; ++i) { tot += fwdCount[i]; mn = std::min(mn, (int)fwdCount[i]); mx = std::max(mx, (int)fwdCount[i]); }
-        MFLAT_LOG_INFO("graph pruned forward degree: mean=%.1f min=%d max=%d",
-                       (double)tot / n, mn, mx);
+        MFLAT_LOG_INFO("graph build: rng prune %.0f ms; forward degree mean=%.1f min=%d max=%d",
+                       pms, (double)tot / n, mn, mx);
     }
 
     // --- 3. reverse edges into the leftover slots ----------------------------
@@ -404,8 +439,10 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     mImpl->entry   = medoid;
     mImpl->dbCount = n;
     mImpl->ready   = true;
+    const double rms = lap();
 
     uploadGpu(mImpl.get());
+    MFLAT_LOG_INFO("graph build: reverse+medoid %.0f ms, gpu upload %.0f ms", rms, lap());
 }
 
 // Cast the float db to fp16 and upload it + the int32 graph as GPU buffers.
