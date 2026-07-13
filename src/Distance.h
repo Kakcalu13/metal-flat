@@ -12,15 +12,35 @@
 // ivf_scan, ivfpq_adc) mirror these same formulas.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <thread>
 #include <vector>
 
 #include "metalflat/Metric.h"
 
 namespace mflat {
 namespace detail {
+
+// Parallel map over [0, n) across hardware threads. Lives here (not
+// Internal.h) so FlatIndex.mm's CPU paths can use it too.
+template <typename Fn>
+void parallelFor(int n, Fn fn) {
+    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    if (n <= 1 || nt == 1) { for (int i = 0; i < n; ++i) fn(i); return; }
+    std::vector<std::thread> pool;
+    const int chunk = (n + static_cast<int>(nt) - 1) / static_cast<int>(nt);
+    for (unsigned t = 0; t < nt; ++t) {
+        const int lo = static_cast<int>(t) * chunk;
+        const int hi = std::min(n, lo + chunk);
+        if (lo < hi) pool.emplace_back([lo, hi, &fn] {
+            for (int i = lo; i < hi; ++i) fn(i);
+        });
+    }
+    for (auto& th : pool) th.join();
+}
 
 // Dot product, float accumulation.
 inline float dot(const float* a, const float* b, int dim) {
