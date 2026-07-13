@@ -40,6 +40,7 @@
 #include "Internal.h"
 #include "Log_internal.h"
 #include "CoarseQuantizer.h"
+#include "TopkMsl.h"   // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
 
 namespace mflat {
 
@@ -74,24 +75,26 @@ inline uint32_t tileCv() {
     return static_cast<uint32_t>(std::min(std::max(x, 8), 256));
 }
 
-NSString* const kShaderSrc = @R"(
-#include <metal_stdlib>
-using namespace metal;
-
+// kTopkMslSrc (src/TopkMsl.h) is prepended to this source at pipeline-build
+// time: it supplies kMaxK, insertTopk and reduceTopkTg (the simdgroup-first
+// top-k reduction shared with FlatIndex / IvfPqIndex).
+NSString* const kShaderBody = @R"(
 struct IvfParams { uint dim; uint k; uint nprobe; uint metric; uint queryCount; };
-
-constant uint kMaxK = 64;
 
 // One THREADGROUP per query (cooperative). The tg's threads split the
 // query's probed-cell vectors round-robin, each keeping a register top-k;
-// then a threadgroup reduction merges the per-thread top-k lists into the
-// final top-k. The query is staged in threadgroup memory once. This
-// replaces the old one-thread-per-query kernel (which left the GPU ~99%
-// idle and serialized every cell). Cell membership ids come back via
-// reorderedIds, so output ids are the caller's original indices. L2 ranks
-// by -dist², so one path serves all metrics; cosine arrives as dot
-// products over already-normalized vectors. Threadgroup buffers: qsh[dim],
-// redScore[tgSize*k], redId[tgSize*k] (sizes set by the host).
+// then reduceTopkTg merges the per-thread lists into the final top-k. The
+// query is staged in threadgroup memory once. This replaces the old
+// one-thread-per-query kernel (which left the GPU ~99% idle and serialized
+// every cell). Cell membership ids come back via reorderedIds, so output ids
+// are the caller's original indices. L2 ranks by -dist², so one path serves
+// all metrics; cosine arrives as dot products over already-normalized
+// vectors. Threadgroup buffers: qsh[dim], redScore/redId[(tgs/32) * kk].
+//
+// The reduction scratch is (tgs/32)*kk — NOT the old tgs*k, which at k=64 fit
+// only a 32-thread threadgroup and left the GPU 8x under-occupied. That
+// throttled GraphIndex's build, whose kNN self-search runs at k=64 (measured
+// 98% of a 400 s SIFT1M graph build).
 kernel void ivf_scan(
     device const half*  reorderedDb  [[buffer(0)]],   // fp16 storage (half BW)
     device const int*   reorderedIds [[buffer(1)]],
@@ -102,15 +105,18 @@ kernel void ivf_scan(
     device float*       outVal       [[buffer(6)]],
     constant IvfParams& p            [[buffer(7)]],
     threadgroup float*  qsh          [[threadgroup(0)]],   // dim
-    threadgroup float*  redScore     [[threadgroup(1)]],   // tgSize × k
-    threadgroup int*    redId        [[threadgroup(2)]],   // tgSize × k
+    threadgroup float*  redScore     [[threadgroup(1)]],   // (tgs/32) × kk
+    threadgroup int*    redId        [[threadgroup(2)]],
     uint                qi           [[threadgroup_position_in_grid]],
     uint                tid          [[thread_position_in_threadgroup]],
-    uint                tgs          [[threads_per_threadgroup]])
+    uint                tgs          [[threads_per_threadgroup]],
+    uint                sgid         [[simdgroup_index_in_threadgroup]],
+    uint                lane         [[thread_index_in_simdgroup]])
 {
     if (qi >= p.queryCount) return;
     const uint dim  = p.dim;
     const uint k    = min(p.k, kMaxK);
+    uint kk = 1; while (kk < k) kk <<= 1;
     const bool isL2 = (p.metric == 0u);
 
     // Stage the query in threadgroup memory once (read by every thread).
@@ -120,7 +126,8 @@ kernel void ivf_scan(
 
     float bestScore[kMaxK];
     int   bestId[kMaxK];
-    for (uint i = 0; i < k; ++i) { bestScore[i] = -INFINITY; bestId[i] = -1; }
+    for (uint i = 0; i < kk; ++i) { bestScore[i] = -INFINITY; bestId[i] = -1; }
+    float worst = -INFINITY;   // keeps the hot compare off the stack-backed array
 
     // Each thread scans a strided subset of every probed cell's block.
     device const int* myCells = probedCells + (uint64_t)qi * p.nprobe;
@@ -152,54 +159,22 @@ kernel void ivf_scan(
                 for (uint c = 0; c < dim; ++c) acc += qsh[c] * float(d[c]);
                 score = acc;
             }
-            if (score > bestScore[0]) {
-                uint pos = 0;
-                while (pos + 1u < k && score > bestScore[pos + 1u]) {
-                    bestScore[pos] = bestScore[pos + 1u];
-                    bestId[pos]    = bestId[pos + 1u];
-                    ++pos;
-                }
-                bestScore[pos] = score;
-                bestId[pos]    = reorderedIds[j];
+            if (score > worst) {
+                insertTopk(bestScore, bestId, kk, score, reorderedIds[j]);
+                worst = bestScore[0];
             }
         }
     }
 
-    // Publish this thread's top-k (ascending) and tree-merge across the
-    // threadgroup: log2(tgs) steps, each merging two ascending top-k lists and
-    // keeping the k largest. Candidate sets are disjoint, so no dedup. Requires
-    // a power-of-two threadgroup size (the host guarantees it).
-    for (uint i = 0; i < k; ++i) {
-        redScore[tid * k + i] = bestScore[i];
-        redId[tid * k + i]    = bestId[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint off = tgs >> 1; off > 0u; off >>= 1) {
-        if (tid < off) {
-            threadgroup float* aS = redScore + tid * k;
-            threadgroup int*   aI = redId    + tid * k;
-            threadgroup float* bS = redScore + (tid + off) * k;
-            threadgroup int*   bI = redId    + (tid + off) * k;
-            float mS[kMaxK];
-            int   mI[kMaxK];
-            int ia = (int)k - 1, ib = (int)k - 1;
-            for (int o = (int)k - 1; o >= 0; --o) {     // fill from the largest
-                const float av = (ia >= 0) ? aS[ia] : -INFINITY;
-                const float bv = (ib >= 0) ? bS[ib] : -INFINITY;
-                if (av >= bv) { mS[o] = av; mI[o] = (ia >= 0) ? aI[ia] : -1; --ia; }
-                else          { mS[o] = bv; mI[o] = (ib >= 0) ? bI[ib] : -1; --ib; }
-            }
-            for (uint i = 0; i < k; ++i) { aS[i] = mS[i]; aI[i] = mI[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    // Candidate sets are disjoint across threads (each db row is scanned by
+    // exactly one), so the merge needs no dedup.
+    reduceTopkTg(bestScore, bestId, kk, redScore, redId, tid, tgs, sgid, lane);
 
     if (tid == 0u) {
         device int*   oi = outIds + (uint64_t)qi * k;
         device float* ov = outVal + (uint64_t)qi * k;
         for (uint i = 0; i < k; ++i) {
-            uint src = k - 1u - i;   // redScore[0..k) ascending -> output descending
+            uint src = kk - 1u - i;   // redScore ascending -> output descending
             oi[i] = redId[src];
             ov[i] = isL2 ? -redScore[src] : redScore[src];
         }
@@ -320,14 +295,17 @@ kernel void ivf_partial_merge(
     device int*         outIds [[buffer(2)]],
     device float*       outVal [[buffer(3)]],
     constant MergeParams& p    [[buffer(4)]],
-    threadgroup float*  redScore [[threadgroup(0)]],   // tgs × k
+    threadgroup float*  redScore [[threadgroup(0)]],   // (tgs/32) × kk
     threadgroup int*    redId    [[threadgroup(1)]],
-    uint qi  [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]])
+    uint qi   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgs  [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
 {
     if (qi >= p.queryCount) return;
     const uint k = min(p.k, kMaxK);
+    uint kk = 1; while (kk < k) kk <<= 1;
     const bool isL2 = (p.metric == 0u);
     const uint total = p.nprobe * k;
     device const float* qS = pScore + (uint64_t)qi * total;
@@ -335,50 +313,20 @@ kernel void ivf_partial_merge(
 
     float bestScore[kMaxK];
     int   bestId[kMaxK];
-    for (uint i = 0; i < k; ++i) { bestScore[i] = -INFINITY; bestId[i] = -1; }
+    for (uint i = 0; i < kk; ++i) { bestScore[i] = -INFINITY; bestId[i] = -1; }
     for (uint e = tid; e < total; e += tgs) {
         const float s  = qS[e];
         const int   id = qI[e];
-        if (id >= 0 && s > bestScore[0]) {
-            uint pos = 0;
-            while (pos + 1u < k && s > bestScore[pos + 1u]) {
-                bestScore[pos] = bestScore[pos + 1u];
-                bestId[pos]    = bestId[pos + 1u];
-                ++pos;
-            }
-            bestScore[pos] = s;
-            bestId[pos]    = id;
-        }
+        if (id >= 0 && s > bestScore[0]) insertTopk(bestScore, bestId, kk, s, id);
     }
-    for (uint i = 0; i < k; ++i) {
-        redScore[tid * k + i] = bestScore[i];
-        redId[tid * k + i]    = bestId[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint off = tgs >> 1; off > 0u; off >>= 1) {
-        if (tid < off) {
-            threadgroup float* aS = redScore + tid * k;
-            threadgroup int*   aI = redId    + tid * k;
-            threadgroup float* bS = redScore + (tid + off) * k;
-            threadgroup int*   bI = redId    + (tid + off) * k;
-            float mS[kMaxK];
-            int   mI[kMaxK];
-            int ia = (int)k - 1, ib = (int)k - 1;
-            for (int o = (int)k - 1; o >= 0; --o) {
-                const float av = (ia >= 0) ? aS[ia] : -INFINITY;
-                const float bv = (ib >= 0) ? bS[ib] : -INFINITY;
-                if (av >= bv) { mS[o] = av; mI[o] = (ia >= 0) ? aI[ia] : -1; --ia; }
-                else          { mS[o] = bv; mI[o] = (ib >= 0) ? bI[ib] : -1; --ib; }
-            }
-            for (uint i = 0; i < k; ++i) { aS[i] = mS[i]; aI[i] = mI[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+
+    reduceTopkTg(bestScore, bestId, kk, redScore, redId, tid, tgs, sgid, lane);
+
     if (tid == 0u) {
         device int*   oi = outIds + (uint64_t)qi * k;
         device float* ov = outVal + (uint64_t)qi * k;
         for (uint i = 0; i < k; ++i) {
-            uint src = k - 1u - i;
+            uint src = kk - 1u - i;
             oi[i] = redId[src];
             ov[i] = isL2 ? -redScore[src] : redScore[src];
         }
@@ -446,7 +394,8 @@ IvfIndex::IvfIndex(int dim, Metric metric, int nlist)
     if (mImpl->device) {
         mImpl->queue = [mImpl->device newCommandQueue];
         NSError* err = nil;
-        id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kShaderSrc
+        NSString* src = [detail::kTopkMslSrc stringByAppendingString:kShaderBody];
+        id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:src
                                                          options:nil
                                                            error:&err];
         if (!lib) {
@@ -670,13 +619,12 @@ IvfIndex::Impl::dispatchTiled(const float* qPtr, const std::vector<int32_t>& pro
         [enc setBuffer:outIdBuf  offset:0 atIndex:2];
         [enc setBuffer:outValBuf offset:0 atIndex:3];
         [enc setBytes:&mp length:sizeof(mp) atIndex:4];
-        const NSUInteger kk = static_cast<NSUInteger>(k);
-        NSUInteger memTg = 30000 / (kk * (sizeof(float) + sizeof(int)));
+        const uint32_t kkP = detail::nextPow2K(k);
         NSUInteger tg2 = std::min<NSUInteger>(mergePipe.maxTotalThreadsPerThreadgroup, 256);
-        tg2 = std::min<NSUInteger>(tg2, std::max<NSUInteger>(memTg, 32));
         { NSUInteger pw = 32; while (pw * 2 <= tg2) pw *= 2; tg2 = pw; }
-        [enc setThreadgroupMemoryLength:tg2 * kk * sizeof(float) atIndex:0];
-        [enc setThreadgroupMemoryLength:tg2 * kk * sizeof(int)   atIndex:1];
+        const NSUInteger scratch2 = detail::topkScratchBytes(tg2, kkP);
+        [enc setThreadgroupMemoryLength:scratch2 atIndex:0];
+        [enc setThreadgroupMemoryLength:scratch2 atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(m), 1, 1)
               threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
         [enc endEncoding];
@@ -726,25 +674,20 @@ IvfIndex::Impl::dispatchScan(const float* qPtr, const int32_t* probedPtr,
         [enc setBuffer:outIdBuf       offset:0 atIndex:5];
         [enc setBuffer:outValBuf      offset:0 atIndex:6];
         [enc setBytes:&p length:sizeof(p) atIndex:7];
-        // One threadgroup per query. Pick the largest threadgroup whose
-        // staged query (dim floats) + reduction scratch (tg × k × (float+int))
-        // fits the threadgroup-memory budget; round to a SIMD-width multiple.
-        const NSUInteger kk  = static_cast<NSUInteger>(k);
-        const NSUInteger qsh = static_cast<NSUInteger>(dim) * sizeof(float);
-        NSUInteger memTg = (qsh < 32000)
-            ? (32000 - qsh) / (kk * (sizeof(float) + sizeof(int)))
-            : 1;
-        NSUInteger tg = std::min<NSUInteger>(
-            scanPipe.maxTotalThreadsPerThreadgroup, 256);
-        tg = std::min<NSUInteger>(tg, std::max<NSUInteger>(memTg, 32));
-        // Floor to a power of two — the tree-merge reduction requires it.
-        NSUInteger pw = 32;
-        while (pw * 2 <= tg) pw *= 2;
-        tg = pw;
+        // One threadgroup per query, always the widest power-of-two group: the
+        // simdgroup-first reduction's scratch is (tg/32)*kk, so k no longer
+        // shrinks the threadgroup (the old tg*k scratch forced tg=32 at k=64 —
+        // 8x under-occupied, which is what made GraphIndex's k=64 self-search
+        // dominate its build).
+        const uint32_t kk = detail::nextPow2K(k);
+        const NSUInteger qsh = (static_cast<NSUInteger>(dim) * sizeof(float) + 15) & ~NSUInteger(15);
+        NSUInteger tg = std::min<NSUInteger>(scanPipe.maxTotalThreadsPerThreadgroup, 256);
+        { NSUInteger pw = 32; while (pw * 2 <= tg) pw *= 2; tg = pw; }
+        const NSUInteger scratch = detail::topkScratchBytes(tg, kk);
 
         [enc setThreadgroupMemoryLength:qsh atIndex:0];
-        [enc setThreadgroupMemoryLength:tg * kk * sizeof(float) atIndex:1];
-        [enc setThreadgroupMemoryLength:tg * kk * sizeof(int)   atIndex:2];
+        [enc setThreadgroupMemoryLength:scratch atIndex:1];
+        [enc setThreadgroupMemoryLength:scratch atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(mG), 1, 1)
               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
