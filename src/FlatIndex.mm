@@ -46,6 +46,7 @@
 #include "metalflat/FlatIndex.h"
 #include "GemmDistance.h"
 #include "Log_internal.h"
+#include "TopkMsl.h"    // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
 #include "Distance.h"   // mflat::detail::{dot,sqL2,rowSqNorms,normalizeRows,score,parallelFor,...}
 
 namespace mflat {
@@ -66,97 +67,14 @@ struct MergeParams {
     uint32_t fold;         // 1 = topk_partial folds the running top-k itself
 };
 
-NSString* const kShaderSrc = @R"(
-#include <metal_stdlib>
-using namespace metal;
-
+// kTopkMslSrc (src/TopkMsl.h) is prepended at pipeline-build time: it supplies
+// kMaxK, insertTopk and reduceTopkTg (the simdgroup-first top-k reduction,
+// shared with IvfIndex / IvfPqIndex).
+NSString* const kShaderBody = @R"(
 struct MergeParams {
     uint tileW; uint tileBase; uint k; uint metric; uint queryCount;
     uint segW; uint numSeg; uint fold;
 };
-
-constant uint kMaxK = 64;
-
-// The per-thread top-k lists are kept ASCENDING over kk = nextPow2(k) slots
-// (index 0 = worst kept; unfilled slots hold -INF/-1). Rounding k up to a
-// power of two lets two lists be merged with the classic bitonic trick:
-// c[i] = max(a[i], b[kk-1-i]) holds the kk largest of the union and is a
-// bitonic sequence, so a log2(kk)-stage bitonic merge re-sorts it. The top k
-// of the kk kept is exactly the true top k.
-
-inline void insertTopk(thread float* s, thread int* id, uint kk, float sc, int gid) {
-    uint pos = 0;
-    while (pos + 1u < kk && sc > s[pos + 1u]) {
-        s[pos] = s[pos + 1u];
-        id[pos] = id[pos + 1u];
-        ++pos;
-    }
-    s[pos] = sc;
-    id[pos] = gid;
-}
-
-// Merge this lane's ascending kk-list with lane^off's (via simd shuffle):
-// pairwise max against the partner's reversed list, then bitonic re-sort.
-// After the butterfly over off = 1,2,...,16 every lane holds the simdgroup's
-// merged top-kk.
-inline void simdMergeTopk(thread float* s, thread int* id, uint kk, uint off) {
-    float ns[kMaxK];
-    int   ni[kMaxK];
-    for (uint i = 0; i < kk; ++i) {
-        const float os = simd_shuffle_xor(s[kk - 1u - i], off);
-        const int   oi = simd_shuffle_xor(id[kk - 1u - i], off);
-        if (os > s[i]) { ns[i] = os;   ni[i] = oi; }
-        else           { ns[i] = s[i]; ni[i] = id[i]; }
-    }
-    for (uint i = 0; i < kk; ++i) { s[i] = ns[i]; id[i] = ni[i]; }
-    for (uint st = kk >> 1; st > 0u; st >>= 1)
-        for (uint i = 0; i < kk; ++i) {
-            const uint j = i | st;
-            if ((i & st) == 0u && j < kk && s[i] > s[j]) {
-                const float ts = s[i]; s[i] = s[j]; s[j] = ts;
-                const int   ti = id[i]; id[i] = id[j]; id[j] = ti;
-            }
-        }
-}
-
-// Two-pointer merge of two ascending kk-lists in threadgroup memory,
-// keeping the kk largest in a (same as the IVF kernels' tree merge step).
-inline void mergeListsTg(threadgroup float* aS, threadgroup int* aI,
-                         threadgroup float* bS, threadgroup int* bI, uint kk) {
-    float mS[kMaxK];
-    int   mI[kMaxK];
-    int ia = (int)kk - 1, ib = (int)kk - 1;
-    for (int o = (int)kk - 1; o >= 0; --o) {
-        const float av = (ia >= 0) ? aS[ia] : -INFINITY;
-        const float bv = (ib >= 0) ? bS[ib] : -INFINITY;
-        if (av >= bv) { mS[o] = av; mI[o] = (ia >= 0) ? aI[ia] : -1; --ia; }
-        else          { mS[o] = bv; mI[o] = (ib >= 0) ? bI[ib] : -1; --ib; }
-    }
-    for (uint i = 0; i < kk; ++i) { aS[i] = mS[i]; aI[i] = mI[i]; }
-}
-
-// Reduce the calling threadgroup's per-thread lists to ONE ascending kk-list
-// in redScore/redId[0..kk): simdgroup shuffle butterfly (register-level, no
-// barriers), lane 0 of each simdgroup publishes, then a cross-simdgroup tree
-// merge. Scratch needed: (tgs/32) * kk entries — small enough that k never
-// constrains the threadgroup size. tgs is a power of two >= 32 (host-set).
-inline void reduceTopkTg(thread float* s, thread int* id, uint kk,
-                         threadgroup float* redScore, threadgroup int* redId,
-                         uint tid, uint tgs, uint sgid, uint lane) {
-    for (uint off = 1u; off < 32u; off <<= 1) simdMergeTopk(s, id, kk, off);
-    if (lane == 0u)
-        for (uint i = 0; i < kk; ++i) {
-            redScore[sgid * kk + i] = s[i];
-            redId[sgid * kk + i]    = id[i];
-        }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint off = (tgs >> 5) >> 1; off > 0u; off >>= 1) {
-        if (tid < off)
-            mergeListsTg(redScore + tid * kk, redId + tid * kk,
-                         redScore + (tid + off) * kk, redId + (tid + off) * kk, kk);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
 
 // Tile scores, shared by all kernels. L2 reconstructs squared distance from
 // ‖q−d‖² = ‖q‖² + ‖d‖² − 2·dot (clamped ≥ 0); ranking is by "score"
@@ -344,12 +262,6 @@ int chooseTileWidth(int m, int n) {
     return static_cast<int>(w);
 }
 
-uint32_t nextPow2(uint32_t x) {
-    uint32_t p = 1;
-    while (p < x) p <<= 1;
-    return p;
-}
-
 // CPU-vs-GPU routing: the GPU dispatch has a fixed ~1.5-3 ms floor; below
 // this much scoring work the multithreaded exact CPU scan wins (measured on
 // M2 Pro via temp/flat_sweep.mm). MFLAT_FLAT_CPU=1/0 forces CPU/GPU.
@@ -482,7 +394,8 @@ FlatIndex::FlatIndex(int dim, Metric metric)
     mImpl->queue = [mImpl->device newCommandQueue];
 
     NSError* err = nil;
-    id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kShaderSrc
+    NSString* src = [detail::kTopkMslSrc stringByAppendingString:kShaderBody];
+    id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:src
                                                      options:nil
                                                        error:&err];
     if (!lib) {
@@ -717,7 +630,7 @@ SearchResult FlatIndex::search(const float* queries, int m, int k) {
                         mImpl->mergePipe.maxTotalThreadsPerThreadgroup});
         NSUInteger pw = 32; while (pw * 2 <= tgW) pw *= 2; tgW = pw;
     }
-    const uint32_t kk = nextPow2(static_cast<uint32_t>(k));
+    const uint32_t kk = detail::nextPow2K(k);
     const bool     fold = (numSeg == 1);
 
     @autoreleasepool {
@@ -786,7 +699,7 @@ SearchResult FlatIndex::search(const float* queries, int m, int k) {
                     threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
             } else {
                 // Scratch: (tgs/32) lists of kk entries; lengths 16B-aligned.
-                const NSUInteger scratch = ((tgW / 32) * kk * 4 + 15) & ~NSUInteger(15);
+                const NSUInteger scratch = detail::topkScratchBytes(tgW, kk);
                 [enc setComputePipelineState:mImpl->partialPipe];
                 [enc setBuffer:tileBuf         offset:0 atIndex:0];
                 [enc setBuffer:qnormBuf        offset:0 atIndex:1];
