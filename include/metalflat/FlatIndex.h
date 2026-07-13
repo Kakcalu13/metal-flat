@@ -36,10 +36,9 @@ struct SearchResult {
 
 class FlatIndex {
 public:
-    // Largest k the GPU path supports in v0 (fixed per-thread top-k
-    // buffers). Requests above this are clamped; documented, not silent
-    // — search() emits a one-time Warn via the log handler (default: stderr;
-    // see metalflat/Log.h).
+    // Largest k the all-GPU selection kernels hold in per-thread registers.
+    // Larger k still works and stays exact: search() switches to GPU GEMM
+    // distances + multithreaded CPU selection for k > kMaxK.
     static constexpr int kMaxK = 64;
 
     FlatIndex(int dim, Metric metric);
@@ -66,9 +65,13 @@ public:
     Metric metric() const;
 
     // For each of `m` row-major queries (m * dim floats) return the `k`
-    // nearest database vectors. k is clamped to [1, kMaxK]. Thread-safe
-    // against other const calls is NOT guaranteed in v0 (the GPU buffer
-    // syncs lazily) — serialize searches or one index per thread.
+    // nearest database vectors (any k >= 1; k <= kMaxK stays fully on the
+    // GPU, larger k selects on the CPU over GPU-computed distances).
+    // Tiny workloads route to an exact multithreaded CPU scan (the GPU
+    // dispatch floor dwarfs the work there); MFLAT_FLAT_CPU=1/0 forces
+    // the CPU/GPU path. Thread-safety against other const calls is NOT
+    // guaranteed in v0 (the GPU buffer syncs lazily) — serialize searches
+    // or use one index per thread.
     SearchResult search(const float* queries, int m, int k);
 
 private:
