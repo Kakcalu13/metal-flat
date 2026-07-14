@@ -457,31 +457,42 @@ void searchCpu(int dim, const CoarseQuantizer& cq,
     const std::vector<int>&   cellStart    = cq.cellStart();
     const std::vector<int>&   reorderedIds = cq.reorderedIds();
     const std::vector<float>& cent         = cq.centroids();
-    parallelFor(m, [&](int qi) {
-        const float* q = qPtr + static_cast<size_t>(qi) * dim;
-        const size_t lutN = static_cast<size_t>(pq.lutSize());
-        std::vector<float> lut(lutN);
-        pq.buildAdcTable(q, lut.data());
-        std::vector<float> comb(residual ? lutN : 0);   // lut + per-cell table
-        std::vector<int> cells(nprobe);
-        cq.probeCellsCpu(q, nprobe, cells.data());
-        std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
-        std::vector<int>   bestId(k, -1);
-        for (int pp = 0; pp < nprobe; ++pp) {
+    const size_t lutN = static_cast<size_t>(pq.lutSize());
+
+    auto insertTopk = [&](float s, int id, std::vector<float>& bestScore,
+                          std::vector<int>& bestId) {
+        int pos = 0;
+        while (pos + 1 < k && s > bestScore[pos + 1]) {
+            bestScore[pos] = bestScore[pos + 1];
+            bestId[pos]    = bestId[pos + 1];
+            ++pos;
+        }
+        bestScore[pos] = s;
+        bestId[pos]    = id;
+    };
+
+    // Scan probe-list slice [ppLo, ppHi) of query `q` into bestScore/bestId.
+    // A SLICE (not the whole list) so the same body serves both the
+    // query-parallel shape and the cell-parallel one used at small m.
+    auto scanSlice = [&](const float* q, const int* cells, int ppLo, int ppHi,
+                         const float* lut, float* comb,
+                         std::vector<float>& bestScore, std::vector<int>& bestId) {
+        for (int pp = ppLo; pp < ppHi; ++pp) {
             const int c = cells[pp];
+            if (c < 0) continue;
             const int lo = cellStart[c], hi = cellStart[c + 1];
             // Residual terms: exact fp32 coarse ||q-c||^2 + the per-cell table.
             // Folding the per-cell table into the query LUT once per cell
             // (M*ksub adds) halves the random loads in the hot loop; only
             // worth it when the cell has enough codes to amortize.
             float base = 0.0f;
-            const float* T = lut.data();
+            const float* T = lut;
             if (residual) {
                 base = sqL2(q, &cent[static_cast<size_t>(c) * dim], dim);
                 const float* Tc = &precomp[static_cast<size_t>(c) * M * ksub];
                 if (static_cast<size_t>(hi - lo) * M >= 2 * lutN) {
                     for (size_t e = 0; e < lutN; ++e) comb[e] = lut[e] + Tc[e];
-                    T = comb.data();
+                    T = comb;
                     Tc = nullptr;
                 }
                 if (Tc) {   // small cell: classic two-table loop
@@ -494,16 +505,7 @@ void searchCpu(int dim, const CoarseQuantizer& cq,
                                   + Tc[static_cast<size_t>(mm) * ksub + cd];
                         }
                         const float s = -dist;
-                        if (s > bestScore[0]) {
-                            int pos = 0;
-                            while (pos + 1 < k && s > bestScore[pos + 1]) {
-                                bestScore[pos] = bestScore[pos + 1];
-                                bestId[pos]    = bestId[pos + 1];
-                                ++pos;
-                            }
-                            bestScore[pos] = s;
-                            bestId[pos]    = reorderedIds[j];
-                        }
+                        if (s > bestScore[0]) insertTopk(s, reorderedIds[j], bestScore, bestId);
                     }
                     continue;
                 }
@@ -514,18 +516,12 @@ void searchCpu(int dim, const CoarseQuantizer& cq,
                 for (int mm = 0; mm < M; ++mm)
                     dist += T[static_cast<size_t>(mm) * ksub + code[mm]];
                 const float s = -dist;
-                if (s > bestScore[0]) {
-                    int pos = 0;
-                    while (pos + 1 < k && s > bestScore[pos + 1]) {
-                        bestScore[pos] = bestScore[pos + 1];
-                        bestId[pos]    = bestId[pos + 1];
-                        ++pos;
-                    }
-                    bestScore[pos] = s;
-                    bestId[pos]    = reorderedIds[j];
-                }
+                if (s > bestScore[0]) insertTopk(s, reorderedIds[j], bestScore, bestId);
             }
         }
+    };
+    auto emit = [&](int qi, const float* q, const std::vector<float>& bestScore,
+                    const std::vector<int>& bestId) {
         // Residual dist already IS ~||q-x||^2; non-residual adds ||q||^2 back.
         const float qn = residual ? 0.0f : dot(q, q, dim);
         for (int i = 0; i < k; ++i) {
@@ -534,6 +530,59 @@ void searchCpu(int dim, const CoarseQuantizer& cq,
             out.ids[o]       = bestId[src];
             out.distances[o] = -bestScore[src] + qn;
         }
+    };
+
+    // SMALL BATCHES: parallelise across CELLS, not queries. Parallelising over
+    // queries leaves every core but one idle at m=1, while that one core still
+    // scans all nprobe*(n/nlist) codes — the same bug IvfIndex had, and the
+    // reason single-query IVF/IVFPQ looked algorithmically doomed.
+    const int nt = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    if (m < nt && nprobe > 1) {
+        for (int qi = 0; qi < m; ++qi) {
+            const float* q = qPtr + static_cast<size_t>(qi) * dim;
+            std::vector<float> lut(lutN);
+            pq.buildAdcTable(q, lut.data());
+            std::vector<int> cells(nprobe);
+            cq.probeCellsCpu(q, nprobe, cells.data());
+
+            const int slices = std::min(nt, nprobe);
+            std::vector<std::vector<float>> pScore(slices,
+                std::vector<float>(k, -std::numeric_limits<float>::infinity()));
+            std::vector<std::vector<int>> pId(slices, std::vector<int>(k, -1));
+            std::vector<std::vector<float>> pComb(slices,
+                std::vector<float>(residual ? lutN : 0));   // per-thread scratch
+            const int chunk = (nprobe + slices - 1) / slices;
+            parallelFor(slices, [&](int t) {
+                const int lo = t * chunk, hi = std::min(nprobe, lo + chunk);
+                if (lo < hi)
+                    scanSlice(q, cells.data(), lo, hi, lut.data(),
+                              residual ? pComb[t].data() : nullptr, pScore[t], pId[t]);
+            });
+
+            std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
+            std::vector<int>   bestId(k, -1);
+            for (int t = 0; t < slices; ++t)
+                for (int e = 0; e < k; ++e)
+                    if (pId[t][e] >= 0 && pScore[t][e] > bestScore[0])
+                        insertTopk(pScore[t][e], pId[t][e], bestScore, bestId);
+            emit(qi, q, bestScore, bestId);
+        }
+        return;
+    }
+
+    // LARGE BATCHES: one query per thread — the queries already fill the machine.
+    parallelFor(m, [&](int qi) {
+        const float* q = qPtr + static_cast<size_t>(qi) * dim;
+        std::vector<float> lut(lutN);
+        pq.buildAdcTable(q, lut.data());
+        std::vector<float> comb(residual ? lutN : 0);
+        std::vector<int> cells(nprobe);
+        cq.probeCellsCpu(q, nprobe, cells.data());
+        std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
+        std::vector<int>   bestId(k, -1);
+        scanSlice(q, cells.data(), 0, nprobe, lut.data(),
+                  residual ? comb.data() : nullptr, bestScore, bestId);
+        emit(qi, q, bestScore, bestId);
     });
 }
 
@@ -715,7 +764,9 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
             const int id = pq.ids[static_cast<size_t>(qi) * kRun + sIdx];
             if (id < 0) continue;
             const float* d = &full[static_cast<size_t>(id) * dim];
-            const float s = detail::score(mImpl->metric, q, d, dim);
+            // scoreFast: 4 independent accumulators (the serial-accumulation
+            // reference stalls this tight rerank loop on its dependency chain).
+            const float s = detail::scoreFast(mImpl->metric, q, d, dim);
             if (s > bestScore[0]) {
                 int pos = 0;
                 while (pos + 1 < k && s > bestScore[pos + 1]) {
