@@ -45,7 +45,8 @@
 #include "Log_internal.h"
 #include "PqTrainer.h"
 #include "CoarseQuantizer.h"
-#include "TopkMsl.h"   // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
+#include "TopkMsl.h"     // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
+#include "GpuScratch.h"  // persistent per-search buffers (no alloc per query)
 #include "Opq.h"
 
 namespace mflat {
@@ -288,6 +289,10 @@ struct IvfPqIndex::Impl {
     id<MTLBuffer>               pqnBuf     = nil;
     id<MTLBuffer>               precompBuf = nil;
 
+    // Per-search buffers, kept alive across calls (see GpuScratch.h).
+    struct Slot { enum { Query = 0, Probed, OutId, OutVal, CoarseVals, LutSpill }; };
+    detail::GpuScratch scratch_;
+
     // GPU ADC search producing the kRun-NN shortlist (qPtr pre-normalized).
     // Member so it can touch the GPU buffers; caller ensures kRun<=kMaxK + GPU.
     void runPqGpu(const float* qPtr, int m, int kRun, int nprobe, SearchResult& pq);
@@ -309,6 +314,7 @@ IvfPqIndex::IvfPqIndex(int dim, Metric metric, int nlist, int m)
     mImpl->device = acquireMetalDevice();
     if (mImpl->device) {
         mImpl->queue = [mImpl->device newCommandQueue];
+        mImpl->scratch_.setDevice(mImpl->device);
         NSError* err = nil;
         NSString* src = [detail::kTopkMslSrc stringByAppendingString:kShaderBody];
         id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:src options:nil error:&err];
@@ -617,21 +623,23 @@ void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
     }
 
     @autoreleasepool {
-        auto bufWith = [&](const void* p, size_t bytes) {
-            return [device newBufferWithBytes:p length:bytes
-                                      options:MTLResourceStorageModeShared];
-        };
-        id<MTLBuffer> qBuf      = bufWith(qPtr, static_cast<size_t>(m) * dim * sizeof(float));
-        id<MTLBuffer> probedBuf = bufWith(probedPtr, static_cast<size_t>(m) * nprobe * sizeof(int32_t));
-        id<MTLBuffer> outIdBuf  = [device newBufferWithLength:static_cast<size_t>(m) * kRun * sizeof(int32_t)
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outValBuf = [device newBufferWithLength:static_cast<size_t>(m) * kRun * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
+        // Persistent scratch, not a fresh allocation per call: newBufferWithBytes
+        // maps pages and touches the driver, and six of them per query is most of
+        // what a single-query GPU search was actually paying for.
+        id<MTLBuffer> qBuf      = scratch_.upload(Slot::Query, qPtr,
+                                                  static_cast<size_t>(m) * dim * sizeof(float));
+        id<MTLBuffer> probedBuf = scratch_.upload(Slot::Probed, probedPtr,
+                                                  static_cast<size_t>(m) * nprobe * sizeof(int32_t));
+        id<MTLBuffer> outIdBuf  = scratch_.ensure(Slot::OutId,
+                                                  static_cast<size_t>(m) * kRun * sizeof(int32_t));
+        id<MTLBuffer> outValBuf = scratch_.ensure(Slot::OutVal,
+                                                  static_cast<size_t>(m) * kRun * sizeof(float));
 
         // Residual-only buffers; pqnBuf stands in when unused (the kernel never
         // reads buffers 10/11 with residual==0, but Metal wants a binding).
         id<MTLBuffer> cvBuf = residualActive
-            ? bufWith(coarseVals.data(), coarseVals.size() * sizeof(float))
+            ? scratch_.upload(Slot::CoarseVals, coarseVals.data(),
+                              coarseVals.size() * sizeof(float))
             : pqnBuf;
 
         PqParams p;
@@ -659,8 +667,9 @@ void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
             chunk = static_cast<int>(std::max<size_t>(
                 1, (64ull << 20) / (lutFloats * sizeof(float))));
             chunk = std::min(chunk, m);
-            lutSpill = [device newBufferWithLength:static_cast<size_t>(chunk) * lutFloats * sizeof(float)
-                                           options:MTLResourceStorageModePrivate];
+            lutSpill = scratch_.ensure(Slot::LutSpill,
+                                       static_cast<size_t>(chunk) * lutFloats * sizeof(float),
+                                       MTLResourceStorageModePrivate);
         }
         p.tgLut = tgLut ? 1u : 0u;
 
@@ -734,12 +743,18 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
     pq.ids.assign(static_cast<size_t>(m) * kRun, -1);
     pq.distances.assign(static_cast<size_t>(m) * kRun, std::numeric_limits<float>::infinity());
 
-    // GPU-vs-CPU routing: the GPU ADC wins at kRun <= 16; above that the
-    // per-thread top-k reduction cost grows with nextPow2(kRun) and the
-    // multithreaded CPU ADC is measured 1.2-3x faster (M2 Pro,
-    // temp/pq_shapes.mm; kRun > kMaxK has no GPU path at all).
+    // GPU-vs-CPU routing.
+    //  - kRun > 16: the GPU ADC's per-thread top-k cost grows with
+    //    nextPow2(kRun); the multithreaded CPU ADC is measured 1.2-3x faster
+    //    (and kRun > kMaxK has no GPU path at all).
+    //  - m <= 4: one threadgroup per query cannot amortise the ~2-5 ms dispatch
+    //    floor. MEASURED at SIFT1M, m=1, rerank=0 (the only config that reached
+    //    the GPU at all): 1.8-6.3 ms on the GPU vs 0.37-0.50 ms on the CPU —
+    //    the GPU path was 4-12x SLOWER for a single query. The CPU ADC
+    //    parallelises across CELLS at small m, so the whole machine works the
+    //    one query (see searchCpu).
     // MFLAT_PQ_CPU=1/0 forces the CPU/GPU path.
-    bool cpuRoute = (kRun > 16);
+    bool cpuRoute = (kRun > 16) || (m <= 4);
     if (const char* e = std::getenv("MFLAT_PQ_CPU")) cpuRoute = (e[0] == '1');
     const bool useGpu = !cpuRoute && mImpl->adcPipe && mImpl->cq->gpuReady() && kRun <= kMaxK;
     if (useGpu) {
