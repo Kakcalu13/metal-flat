@@ -487,25 +487,22 @@ void searchCpu(const CoarseQuantizer& cq, const std::vector<float>& reorderedDb,
                SearchResult& out, int qOffset = 0, const int32_t* probedRows = nullptr) {
     const std::vector<int>& cellStart    = cq.cellStart();
     const std::vector<int>& reorderedIds = cq.reorderedIds();
-    parallelFor(m, [&](int i) {
-        const int qi = qOffset + i;
-        const float* q = qPtr + static_cast<size_t>(qi) * dim;
-        std::vector<int> cells(nprobe);
-        if (probedRows)
-            for (int p = 0; p < nprobe; ++p)
-                cells[p] = probedRows[static_cast<size_t>(qi) * nprobe + p];
-        else
-            cq.probeCellsCpu(q, nprobe, cells.data());
 
-        std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
-        std::vector<int>   bestId(k, -1);
-        for (int pp = 0; pp < nprobe; ++pp) {
-            const int c  = cells[pp];
+    // Scan one query's probed cells and emit its top-k. `lo`..`hi` select a
+    // SLICE of that query's probe list, so the same code serves both the
+    // query-parallel path (whole list, one thread) and the cell-parallel path
+    // (a slice per thread), with the slices' top-k lists merged by the caller.
+    auto scanSlice = [&](const float* q, const int* cells, int lo, int hi,
+                         std::vector<float>& bestScore, std::vector<int>& bestId) {
+        for (int pp = lo; pp < hi; ++pp) {
+            const int c = cells[pp];
             if (c < 0) continue;
-            const int lo = cellStart[c];
-            const int hi = cellStart[c + 1];
-            for (int j = lo; j < hi; ++j) {
-                const float s = detail::score(metric, q,
+            const int cs = cellStart[c], ce = cellStart[c + 1];
+            for (int j = cs; j < ce; ++j) {
+                // scoreFast: 4 independent accumulators. The scan is a tight FMA
+                // loop over contiguous rows, so the serial-accumulation reference
+                // left it latency-bound on the dependency chain (~3x slower).
+                const float s = detail::scoreFast(metric, q,
                         &reorderedDb[static_cast<size_t>(j) * dim], dim);
                 if (s > bestScore[0]) {
                     int pos = 0;
@@ -519,12 +516,78 @@ void searchCpu(const CoarseQuantizer& cq, const std::vector<float>& reorderedDb,
                 }
             }
         }
+    };
+    auto emit = [&](int qi, const std::vector<float>& bestScore, const std::vector<int>& bestId) {
         for (int i = 0; i < k; ++i) {
             const int src = k - 1 - i;
             const size_t o = static_cast<size_t>(qi) * k + i;
             out.ids[o]       = bestId[src];
             out.distances[o] = detail::scoreToValue(metric, bestScore[src]);
         }
+    };
+    auto probeOf = [&](int qi, const float* q, std::vector<int>& cells) {
+        if (probedRows)
+            for (int p = 0; p < nprobe; ++p)
+                cells[p] = probedRows[static_cast<size_t>(qi) * nprobe + p];
+        else
+            cq.probeCellsCpu(q, nprobe, cells.data());
+    };
+
+    // SMALL BATCHES: parallelize across CELLS, not queries. Parallelising over
+    // queries leaves every core but one idle at m=1 — and a single query still
+    // scans nprobe*(n/nlist) candidates (~62k at SIFT1M/nprobe=64), so it was
+    // paying the full scan on 1/Nth of the machine. That, not the algorithm, is
+    // why single-query IVF measured ~7x slower than the graph index.
+    const int nt = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    if (m < nt && nprobe > 1) {
+        for (int i = 0; i < m; ++i) {
+            const int qi = qOffset + i;
+            const float* q = qPtr + static_cast<size_t>(qi) * dim;
+            std::vector<int> cells(nprobe);
+            probeOf(qi, q, cells);
+
+            // One partial top-k per thread over a contiguous slice of the probe
+            // list; then merge the partials (all disjoint candidate sets).
+            const int slices = std::min(nt, nprobe);
+            std::vector<std::vector<float>> pScore(slices,
+                std::vector<float>(k, -std::numeric_limits<float>::infinity()));
+            std::vector<std::vector<int>> pId(slices, std::vector<int>(k, -1));
+            const int chunk = (nprobe + slices - 1) / slices;
+            parallelFor(slices, [&](int t) {
+                const int lo = t * chunk, hi = std::min(nprobe, lo + chunk);
+                if (lo < hi) scanSlice(q, cells.data(), lo, hi, pScore[t], pId[t]);
+            });
+
+            std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
+            std::vector<int>   bestId(k, -1);
+            for (int t = 0; t < slices; ++t)
+                for (int e = 0; e < k; ++e) {
+                    const float s = pScore[t][e];
+                    if (pId[t][e] < 0 || s <= bestScore[0]) continue;
+                    int pos = 0;
+                    while (pos + 1 < k && s > bestScore[pos + 1]) {
+                        bestScore[pos] = bestScore[pos + 1];
+                        bestId[pos]    = bestId[pos + 1];
+                        ++pos;
+                    }
+                    bestScore[pos] = s;
+                    bestId[pos]    = pId[t][e];
+                }
+            emit(qi, bestScore, bestId);
+        }
+        return;
+    }
+
+    // LARGE BATCHES: one query per thread — the queries already fill the machine.
+    parallelFor(m, [&](int i) {
+        const int qi = qOffset + i;
+        const float* q = qPtr + static_cast<size_t>(qi) * dim;
+        std::vector<int> cells(nprobe);
+        probeOf(qi, q, cells);
+        std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
+        std::vector<int>   bestId(k, -1);
+        scanSlice(q, cells.data(), 0, nprobe, bestScore, bestId);
+        emit(qi, bestScore, bestId);
     });
 }
 
@@ -736,8 +799,12 @@ SearchResult IvfIndex::search(const float* queries, int m, int k, int nprobe) {
     }
 
     // Tiny batches: the GPU dispatch has a fixed ~2-4 ms cost that dwarfs the
-    // work — the multithreaded CPU path is measured 2-5x faster there.
-    if (m <= 4 && nprobe <= 64) {
+    // work — the CPU path (which parallelises across CELLS at small m, so the
+    // whole machine works on the one query) is measured far faster there. The
+    // nprobe cap this used to carry was a trap: at nprobe > 64 a single query
+    // fell onto the GPU and cost 5.7 ms instead of ~0.6 ms. Scanning more cells
+    // is exactly when the CPU path is MORE worthwhile, not less.
+    if (m <= 4) {
         searchCpu(*mImpl->cq, mImpl->reorderedDb, dim, mImpl->metric,
                   qPtr, m, k, nprobe, out);
         return out;
