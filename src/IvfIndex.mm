@@ -40,7 +40,8 @@
 #include "Internal.h"
 #include "Log_internal.h"
 #include "CoarseQuantizer.h"
-#include "TopkMsl.h"   // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
+#include "TopkMsl.h"     // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
+#include "GpuScratch.h"  // persistent per-search buffers (no alloc per query)
 
 namespace mflat {
 
@@ -361,6 +362,12 @@ struct IvfIndex::Impl {
     id<MTLComputePipelineState> mergePipe = nil;   // query-tiled phase 2
     id<MTLBuffer>               dbBuf     = nil;   // reorderedDb as fp16 (half)
 
+    // Per-search buffers, kept alive across calls (see GpuScratch.h): a fresh
+    // Metal allocation per search is most of what a SINGLE query pays for.
+    struct Slot { enum { Query = 0, Probed, OutId, OutVal,
+                         Entries, QStart, WorkCell, WorkOff, PScore, PId }; };
+    detail::GpuScratch scratch;
+
     // A committed-but-not-awaited GPU fine scan over the FIRST `rows` queries.
     // The command buffer retains its resources until completion, so callers
     // may run CPU work (the hybrid split's CPU slice) between dispatch and
@@ -393,6 +400,7 @@ IvfIndex::IvfIndex(int dim, Metric metric, int nlist)
     mImpl->device = acquireMetalDevice();
     if (mImpl->device) {
         mImpl->queue = [mImpl->device newCommandQueue];
+        mImpl->scratch.setDevice(mImpl->device);
         NSError* err = nil;
         NSString* src = [detail::kTopkMslSrc stringByAppendingString:kShaderBody];
         id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:src
@@ -624,23 +632,15 @@ IvfIndex::Impl::dispatchTiled(const float* qPtr, const std::vector<int32_t>& pro
     const uint32_t workCount = static_cast<uint32_t>(workCell.size());
 
     @autoreleasepool {
-        auto bufWith = [&](const void* p, size_t bytes) {
-            return [device newBufferWithBytes:p length:bytes
-                                      options:MTLResourceStorageModeShared];
-        };
-        id<MTLBuffer> qBuf     = bufWith(qPtr, static_cast<size_t>(m) * dim * sizeof(float));
-        id<MTLBuffer> entBuf   = bufWith(entries.data(),  entries.size()  * sizeof(uint32_t));
-        id<MTLBuffer> qsBuf    = bufWith(qStart.data(),   qStart.size()   * sizeof(int32_t));
-        id<MTLBuffer> wcBuf    = bufWith(workCell.data(), workCell.size() * sizeof(int32_t));
-        id<MTLBuffer> woBuf    = bufWith(workOff.data(),  workOff.size()  * sizeof(int32_t));
-        id<MTLBuffer> pScore   = [device newBufferWithLength:static_cast<size_t>(E) * k * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> pId      = [device newBufferWithLength:static_cast<size_t>(E) * k * sizeof(int32_t)
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outIdBuf = [device newBufferWithLength:static_cast<size_t>(m) * k * sizeof(int32_t)
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outValBuf = [device newBufferWithLength:static_cast<size_t>(m) * k * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qBuf     = scratch.upload(Slot::Query,    qPtr, static_cast<size_t>(m) * dim * sizeof(float));
+        id<MTLBuffer> entBuf   = scratch.upload(Slot::Entries,  entries.data(),  entries.size()  * sizeof(uint32_t));
+        id<MTLBuffer> qsBuf    = scratch.upload(Slot::QStart,   qStart.data(),   qStart.size()   * sizeof(int32_t));
+        id<MTLBuffer> wcBuf    = scratch.upload(Slot::WorkCell, workCell.data(), workCell.size() * sizeof(int32_t));
+        id<MTLBuffer> woBuf    = scratch.upload(Slot::WorkOff,  workOff.data(),  workOff.size()  * sizeof(int32_t));
+        id<MTLBuffer> pScore   = scratch.ensure(Slot::PScore,   static_cast<size_t>(E) * k * sizeof(float));
+        id<MTLBuffer> pId      = scratch.ensure(Slot::PId,      static_cast<size_t>(E) * k * sizeof(int32_t));
+        id<MTLBuffer> outIdBuf = scratch.ensure(Slot::OutId,    static_cast<size_t>(m) * k * sizeof(int32_t));
+        id<MTLBuffer> outValBuf = scratch.ensure(Slot::OutVal,  static_cast<size_t>(m) * k * sizeof(float));
 
         TileParams tp;
         tp.dim = (uint32_t)dim; tp.k = (uint32_t)k; tp.nprobe = (uint32_t)nprobe;
@@ -704,20 +704,14 @@ IvfIndex::Impl::PendingGpu
 IvfIndex::Impl::dispatchScan(const float* qPtr, const int32_t* probedPtr,
                              int mG, int k, int nprobe) {
     @autoreleasepool {
-        id<MTLBuffer> qBuf = [device
-            newBufferWithBytes:qPtr
-                        length:static_cast<size_t>(mG) * dim * sizeof(float)
-                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> probedBuf = [device
-            newBufferWithBytes:probedPtr
-                        length:static_cast<size_t>(mG) * nprobe * sizeof(int32_t)
-                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outIdBuf = [device
-            newBufferWithLength:static_cast<size_t>(mG) * k * sizeof(int32_t)
-                        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outValBuf = [device
-            newBufferWithLength:static_cast<size_t>(mG) * k * sizeof(float)
-                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qBuf      = scratch.upload(Slot::Query,  qPtr,
+                                    static_cast<size_t>(mG) * dim * sizeof(float));
+        id<MTLBuffer> probedBuf = scratch.upload(Slot::Probed, probedPtr,
+                                    static_cast<size_t>(mG) * nprobe * sizeof(int32_t));
+        id<MTLBuffer> outIdBuf  = scratch.ensure(Slot::OutId,
+                                    static_cast<size_t>(mG) * k * sizeof(int32_t));
+        id<MTLBuffer> outValBuf = scratch.ensure(Slot::OutVal,
+                                    static_cast<size_t>(mG) * k * sizeof(float));
 
         IvfParams p;
         p.dim        = static_cast<uint32_t>(dim);
