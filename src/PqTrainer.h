@@ -36,8 +36,11 @@ public:
     // Train per-subspace k-means on `training` (n×dim). If codesOut != nullptr,
     // fills n*m codes taken DIRECTLY from the k-means assignment (bit-exact —
     // a re-encode() would tie-break differently). No-op on invalid config.
+    // maxPointsPerCentroid > 0 subsamples the TRAINING (faiss-style); the final
+    // assignment pass still covers all n, so codesOut stays complete.
     void train(const float* training, int n, int iters,
-               std::vector<uint8_t>* codesOut = nullptr) {
+               std::vector<uint8_t>* codesOut = nullptr,
+               int maxPointsPerCentroid = 0) {
         trained_ = false;
         if (dim_ <= 0 || m_ <= 0 || dim_ % m_ != 0 || ksub_ > 256) return;
         centroids_.assign(static_cast<size_t>(m_) * ksub_ * dsub_, 0.0f);
@@ -52,7 +55,8 @@ public:
             });
             std::vector<float> subCent;
             std::vector<int>   subAssign;
-            kmeansGpu(sub.data(), n, dsub_, ksub_, iters, subCent, subAssign);
+            kmeansGpu(sub.data(), n, dsub_, ksub_, iters, subCent, subAssign,
+                      maxPointsPerCentroid);
             std::copy(subCent.begin(), subCent.end(),
                       &centroids_[static_cast<size_t>(mm) * ksub_ * dsub_]);
             for (int j = 0; j < ksub_; ++j) {
