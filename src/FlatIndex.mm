@@ -47,6 +47,7 @@
 #include "GemmDistance.h"
 #include "Log_internal.h"
 #include "TopkMsl.h"    // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
+#include "GpuScratch.h" // persistent per-search buffers (no alloc per query)
 #include "Distance.h"   // mflat::detail::{dot,sqL2,rowSqNorms,normalizeRows,score,parallelFor,...}
 
 namespace mflat {
@@ -319,6 +320,13 @@ struct FlatIndex::Impl {
     id<MTLBuffer> partId    = nil;
     size_t        partCap   = 0;        // capacity in entries
 
+    // Query/output buffers, kept alive across calls (see GpuScratch.h). This
+    // index is on everyone's hot path — the IVF coarse probe and the k-means
+    // assignment both drive it — so an allocation per search was being paid
+    // over and over, and at m=1 it dominated.
+    struct Slot { enum { Query = 0, QNorm, RunScore, RunId, QueryBig }; };
+    detail::GpuScratch scratch;
+
     bool ready = false;
 
     void ensureBuffer() {
@@ -392,6 +400,7 @@ FlatIndex::FlatIndex(int dim, Metric metric)
         return;
     }
     mImpl->queue = [mImpl->device newCommandQueue];
+    mImpl->scratch.setDevice(mImpl->device);
 
     NSError* err = nil;
     NSString* src = [detail::kTopkMslSrc stringByAppendingString:kShaderBody];
@@ -509,10 +518,8 @@ SearchResult FlatIndex::Impl::searchGemmCpuTopk(const float* qPtr,
     std::vector<int>  heapSize(m, 0);
 
     @autoreleasepool {
-        id<MTLBuffer> qBuf = [device
-            newBufferWithBytes:qPtr
-                        length:static_cast<size_t>(m) * dim * sizeof(float)
-                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qBuf = scratch.upload(Slot::QueryBig, qPtr,
+                                            static_cast<size_t>(m) * dim * sizeof(float));
         ensureSharedTiles(static_cast<size_t>(m) * tileW);
 
         auto kick = [&](int base, int tw, int slot) -> id<MTLCommandBuffer> {
@@ -634,24 +641,16 @@ SearchResult FlatIndex::search(const float* queries, int m, int k) {
     const bool     fold = (numSeg == 1);
 
     @autoreleasepool {
-        id<MTLBuffer> qBuf = [mImpl->device
-            newBufferWithBytes:qPtr
-                        length:static_cast<size_t>(m) * dim * sizeof(float)
-                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> qnormBuf = [mImpl->device
-            newBufferWithBytes:qn.data()
-                        length:static_cast<size_t>(m) * sizeof(float)
-                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qBuf = mImpl->scratch.upload(
+            Impl::Slot::Query, qPtr, static_cast<size_t>(m) * dim * sizeof(float));
+        id<MTLBuffer> qnormBuf = mImpl->scratch.upload(
+            Impl::Slot::QNorm, qn.data(), static_cast<size_t>(m) * sizeof(float));
 
         // Running per-query top-k, initialised to the empty state
         // (score -inf, id -1), ascending so index 0 is the worst kept.
         const size_t rkN = static_cast<size_t>(m) * k;
-        id<MTLBuffer> runScore = [mImpl->device
-            newBufferWithLength:rkN * sizeof(float)
-                        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> runId = [mImpl->device
-            newBufferWithLength:rkN * sizeof(int32_t)
-                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> runScore = mImpl->scratch.ensure(Impl::Slot::RunScore, rkN * sizeof(float));
+        id<MTLBuffer> runId    = mImpl->scratch.ensure(Impl::Slot::RunId,    rkN * sizeof(int32_t));
         {
             float*   rs = static_cast<float*>([runScore contents]);
             int32_t* ri = static_cast<int32_t*>([runId contents]);
