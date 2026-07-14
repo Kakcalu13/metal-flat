@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <chrono>
 #include <cstdio>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <queue>
@@ -25,6 +26,7 @@
 #include "metalflat/IvfIndex.h"
 #include "Internal.h"        // detail::parallelFor, normalizeRows, sqL2, score, acquireMetalDevice
 #include "PqTrainer.h"       // detail::PqTrainer — the traversal's LOSSLESS neighbour filter
+#include "GpuScratch.h"      // persistent per-search buffers (no alloc per query)
 #include "Log_internal.h"    // MFLAT_LOG_ERROR
 
 namespace mflat {
@@ -308,6 +310,10 @@ struct GraphIndex::Impl {
     id<MTLBuffer>               dbBuf    = nil;   // db as fp16 (half), id order
     id<MTLBuffer>               graphBuf = nil;   // dbCount × R int32
 
+    // Per-search buffers, kept alive across calls (see GpuScratch.h).
+    struct Slot { enum { Query = 0, OutId, OutVal }; };
+    detail::GpuScratch scratch;
+
     // The fp16 db, addressed from the CPU. dbBuf is StorageModeShared, so the
     // CPU traversal can score straight out of the GPU's copy — half the bytes
     // per row, zero extra memory. nil without a Metal device (CPU uses fp32).
@@ -324,6 +330,7 @@ GraphIndex::GraphIndex(int dim, Metric metric, int R)
     mImpl->device = acquireMetalDevice();
     if (mImpl->device) {
         mImpl->queue = [mImpl->device newCommandQueue];
+        mImpl->scratch.setDevice(mImpl->device);
         NSError* err = nil;
         id<MTLLibrary> lib = [mImpl->device newLibraryWithSource:kGraphShaderSrc
                                                          options:nil error:&err];
@@ -1037,13 +1044,29 @@ SearchResult GraphIndex::search(const float* queries, int m, int k, int L, int m
     // GPU path needs a threadgroup of at least Lc threads. Fall back to CPU when
     // Lc exceeds the device's max threadgroup, or the pipeline is unavailable.
     //
-    // Small batches also route to the CPU: the kernel runs ONE threadgroup per
-    // query, so the GPU is dispatch-latency-bound until ~a hundred queries are
-    // in flight, and the dynamic best-first CPU search is measured 3-14x faster
-    // there at IDENTICAL recall (m=1 L=64: 0.21 vs 2.97 ms; crossover m≈96-128
-    // across L=32..128 on SIFT1M — temp/graph_latency.mm). MFLAT_GRAPH_CPU=1/0
-    // forces the CPU/GPU path.
-    bool cpuRoute = (m < 96);
+    // CPU-vs-GPU routing, and the crossover depends on BOTH m and L.
+    //
+    //   m: the kernel runs ONE threadgroup per query, so a small batch cannot
+    //      fill the GPU (a single query is round-trip-bound).
+    //   L: the kernel re-sorts its whole beam every iteration — a cooperative
+    //      bitonic over Lc = nextPow2(L + W*R) entries — so its per-iteration
+    //      cost grows with L, while the CPU walk inserts into a bounded beam in
+    //      O(log L) and prunes neighbours with the lossless filter (which the
+    //      kernel does NOT have). Past L~64 the CPU wins at EVERY batch size.
+    //
+    // Measured on SIFT1M (temp/gx.mm, gpu ms vs cpu ms, R=63, W=1):
+    //   L=32:  m=256  3.0 / 4.2  -> GPU     ; m=8192  75.8 / 137.3 -> GPU
+    //   L=64:  m=256  9.4 / 7.2  -> CPU     ; m=512   15.8 / 16.8  -> GPU
+    //   L=128: m=1000 88.9 / 57.6 -> CPU    ; m=8192 723.2 / 375.2 -> CPU
+    //
+    // These cutoffs are a curve fit to THIS machine, which is a weakness (see
+    // the note in here.txt). The real fix is the kernel: give it the filter and
+    // stop re-sorting the beam every iteration, and the GPU should take L=128
+    // back. MFLAT_GRAPH_CPU=1/0 forces the CPU/GPU path.
+    const int gpuMinBatch = (L <= 32) ? 256
+                          : (L <= 64) ? 512
+                          : INT_MAX;          // L > 64: the CPU wins outright
+    bool cpuRoute = (m < gpuMinBatch);
     if (const char* e = std::getenv("MFLAT_GRAPH_CPU")) cpuRoute = (e[0] != '0');
     const NSUInteger maxT = mImpl->pipe ? mImpl->pipe.maxTotalThreadsPerThreadgroup : 0;
     const bool gpu = !cpuRoute && mImpl->pipe && mImpl->dbBuf && k <= kMaxK
@@ -1069,15 +1092,13 @@ SearchResult GraphIndex::search(const float* queries, int m, int k, int L, int m
     }
 
     @autoreleasepool {
-        id<MTLBuffer> qBuf = [mImpl->device
-            newBufferWithBytes:qPtr length:static_cast<size_t>(m) * dim * sizeof(float)
-                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outIdBuf = [mImpl->device
-            newBufferWithLength:static_cast<size_t>(m) * k * sizeof(int32_t)
-                        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outValBuf = [mImpl->device
-            newBufferWithLength:static_cast<size_t>(m) * k * sizeof(float)
-                        options:MTLResourceStorageModeShared];
+        // Persistent scratch, not a fresh allocation per call (see GpuScratch.h).
+        id<MTLBuffer> qBuf = mImpl->scratch.upload(
+            Impl::Slot::Query, qPtr, static_cast<size_t>(m) * dim * sizeof(float));
+        id<MTLBuffer> outIdBuf = mImpl->scratch.ensure(
+            Impl::Slot::OutId, static_cast<size_t>(m) * k * sizeof(int32_t));
+        id<MTLBuffer> outValBuf = mImpl->scratch.ensure(
+            Impl::Slot::OutVal, static_cast<size_t>(m) * k * sizeof(float));
 
         GraphParams p;
         p.dim = (uint32_t)dim; p.k = (uint32_t)k; p.L = (uint32_t)L; p.R = (uint32_t)R;
