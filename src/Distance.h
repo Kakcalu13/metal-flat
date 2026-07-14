@@ -87,6 +87,35 @@ inline void normalizeRows(std::vector<float>& v, int n, int dim) {
 inline float score(Metric m, const float* q, const float* d, int dim) {
     return m == Metric::L2 ? -sqL2(q, d, dim) : dot(q, d, dim);
 }
+
+// Throughput scorer: same value as score(), but with FOUR independent
+// accumulators so the FMAs pipeline (and clang vectorizes) instead of stalling
+// on one serial dependency chain — measured ~3x on the IVF CPU scan.
+//
+// NOT bit-identical to score(): the summation order differs, so ties can break
+// differently. Use it where the contract is RECALL (the CPU scan paths); keep
+// score()/dot()/sqL2() where the contract is bit-stability (the reference).
+inline float scoreFast(Metric m, const float* a, const float* b, int dim) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int c = 0;
+    if (m == Metric::L2) {
+        for (; c + 4 <= dim; c += 4) {
+            const float e0 = a[c] - b[c],         e1 = a[c + 1] - b[c + 1];
+            const float e2 = a[c + 2] - b[c + 2], e3 = a[c + 3] - b[c + 3];
+            s0 += e0 * e0; s1 += e1 * e1; s2 += e2 * e2; s3 += e3 * e3;
+        }
+        float s = (s0 + s1) + (s2 + s3);
+        for (; c < dim; ++c) { const float e = a[c] - b[c]; s += e * e; }
+        return -s;
+    }
+    for (; c + 4 <= dim; c += 4) {
+        s0 += a[c] * b[c];         s1 += a[c + 1] * b[c + 1];
+        s2 += a[c + 2] * b[c + 2]; s3 += a[c + 3] * b[c + 3];
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    for (; c < dim; ++c) s += a[c] * b[c];
+    return s;
+}
 // Convert a ranking score back to the reported distance / similarity value.
 inline float scoreToValue(Metric m, float s) { return m == Metric::L2 ? -s : s; }
 // The "no neighbour" sentinel distance/similarity for a metric.
