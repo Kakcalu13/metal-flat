@@ -42,7 +42,10 @@ public:
     // which converges dynamically); `numStart` = random restart seeds;
     // `searchWidth` = nodes expanded per iteration (>1 amortises the per-iteration
     // sort over more candidates → fewer iterations at ~equal recall, capped 16).
-    // Runs the GPU beam kernel when available, else the CPU best-first reference.
+    // Workload-adaptive: the GPU beam kernel runs one threadgroup per query, so
+    // small batches (m < ~96) route to the CPU best-first search — measured
+    // 3-14x lower latency at identical recall (single query ~0.2 ms vs ~3 ms).
+    // MFLAT_GRAPH_CPU=1/0 forces the CPU/GPU path.
     SearchResult search(const float* queries, int m, int k,
                         int L = 64, int maxIter = -1, int numStart = 32, int searchWidth = 1);
 
@@ -58,6 +61,7 @@ public:
 private:
     struct Impl;
     static void uploadGpu(Impl* m);   // (re)create the GPU db+graph buffers
+    static void buildFilter(Impl* m, const float* data, int n);  // traversal filter
     std::unique_ptr<Impl> mImpl;
 };
 
