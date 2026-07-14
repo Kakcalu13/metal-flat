@@ -24,6 +24,7 @@
 #include "metalflat/GraphIndex.h"
 #include "metalflat/IvfIndex.h"
 #include "Internal.h"        // detail::parallelFor, normalizeRows, sqL2, score, acquireMetalDevice
+#include "PqTrainer.h"       // detail::PqTrainer — the traversal's LOSSLESS neighbour filter
 #include "Log_internal.h"    // MFLAT_LOG_ERROR
 
 namespace mflat {
@@ -281,12 +282,38 @@ struct GraphIndex::Impl {
     std::vector<float>   db;       // dbCount × dim (metric-normalized copy; CPU path)
     std::vector<int32_t> graph;    // dbCount × R adjacency (original ids, -1 pad)
 
+    // LOSSLESS neighbour filter for the CPU traversal (see searchCpu).
+    //   pqCodes: dbCount × pqM bytes (~16 MB at n=1M — sits in the SLC)
+    //   pqErr  : dbCount floats, e_i = ||x_i - decode(code_i)||
+    // ADC yields ||q - x̂||^2 EXACTLY, so ||q-x|| >= ||q-x̂|| - e_i is a hard
+    // lower bound: a neighbour whose bound already exceeds the beam's worst kept
+    // distance can never enter the beam, so its full row is never fetched. No
+    // false negatives => results stay bit-identical to the plain exact walk, so
+    // this buys latency without touching recall or CPU/GPU parity.
+    std::unique_ptr<detail::PqTrainer> pq;
+    std::vector<uint8_t>               pqCodes;
+    std::vector<float>                 pqErr;
+    int                                pqM = 0;
+    // Codebook TRANSPOSED to [subspace][d][centroid]. PqTrainer's natural layout
+    // ([centroid][d]) makes the per-query LUT a strided scalar dot per centroid —
+    // measured ~25 us/query, which swamped the filter's savings. Transposed, the
+    // LUT is dsub contiguous axpy passes over 256 floats: pure SIMD, ~5 us.
+    std::vector<float>                 pqCenT;   // pqM × dsub × ksub
+    std::vector<float>                 pqNorm;   // pqM × ksub  (||c||^2)
+
     // GPU beam-search path.
     id<MTLDevice>               device   = nil;
     id<MTLCommandQueue>         queue    = nil;
     id<MTLComputePipelineState> pipe     = nil;
     id<MTLBuffer>               dbBuf    = nil;   // db as fp16 (half), id order
     id<MTLBuffer>               graphBuf = nil;   // dbCount × R int32
+
+    // The fp16 db, addressed from the CPU. dbBuf is StorageModeShared, so the
+    // CPU traversal can score straight out of the GPU's copy — half the bytes
+    // per row, zero extra memory. nil without a Metal device (CPU uses fp32).
+    const __fp16* dbHalfCpu() const {
+        return dbBuf ? static_cast<const __fp16*>([dbBuf contents]) : nullptr;
+    }
 };
 
 GraphIndex::GraphIndex(int dim, Metric metric, int R)
@@ -442,8 +469,94 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     const double rms = lap();
 
     uploadGpu(mImpl.get());
-    MFLAT_LOG_INFO("graph build: reverse+medoid %.0f ms, gpu upload %.0f ms", rms, lap());
+    const double ums = lap();
+
+    buildFilter(mImpl.get(), data, n);
+    MFLAT_LOG_INFO("graph build: reverse+medoid %.0f ms, gpu upload %.0f ms, "
+                   "filter codes %.0f ms", rms, ums, lap());
 }
+
+// Train the traversal filter: PQ codes + each vector's quantization error.
+// pqM targets dim/8 (16 bytes at dim=128 => one cache line per neighbour, and a
+// ~16 MB table at n=1M, which the system-level cache can hold — the whole point).
+// L2 / Cosine only: the bound is a statement about Euclidean distance, and Cosine
+// arrives L2-normalized so its ranking is the same. Failure is silent and safe —
+// searchCpu just scores full rows, as before.
+void GraphIndex::buildFilter(Impl* m, const float* data, int n) {
+    m->pq.reset();
+    m->pqCodes.clear();
+    m->pqErr.clear();
+    m->pqM = 0;
+    if (m->metric == Metric::InnerProduct) return;
+    if (std::getenv("MFLAT_GRAPH_NOFILTER")) return;
+
+    // Code size drives the bound's TIGHTNESS, which is the whole game: the filter
+    // only pays when it rejects a large fraction of neighbours, and rejection is
+    // governed by e_i = ||x - x̂||. Measured on SIFT1M (skip rate / net latency):
+    //   dsub=8 (16 B):   1.2% skipped -> a LOSS (all LUT cost, no savings)
+    //   dsub=4 (32 B):  13.8% skipped -> ~break-even
+    //   dsub=2 (64 B):  53.9% skipped -> ~10% faster, and 64 B is one cache line
+    // So target dsub=2 within a 64-byte code budget, and DON'T enable the filter
+    // at all when dim is too large to reach a tight bound within that budget —
+    // a loose filter is pure overhead. MFLAT_GRAPH_PQM overrides.
+    const int dim = m->dim;
+    int sub = std::min(64, std::max(1, dim / 2));
+    if (const char* e = std::getenv("MFLAT_GRAPH_PQM")) sub = atoi(e);   // tuning hook
+    while (sub > 1 && dim % sub != 0) --sub;
+    if (sub < 2) return;
+    const int dsubWant = dim / sub;
+    if (dsubWant > 4 && !std::getenv("MFLAT_GRAPH_PQM")) {
+        MFLAT_LOG_INFO("graph: traversal filter off (dim=%d needs dsub=%d > 4 "
+                       "within a 64B code; the bound would be too loose to pay)",
+                       dim, dsubWant);
+        return;
+    }
+
+    // Subsample the codebook training (256 points/centroid, faiss-style): the
+    // codebook barely moves, and the bound stays EXACT regardless because e_i is
+    // measured against whatever codebook comes out. The final assignment pass
+    // still encodes all n. Measured: 3.8 s -> well under 1 s of build.
+    auto pq = std::make_unique<detail::PqTrainer>(dim, sub);
+    std::vector<uint8_t> codes;
+    pq->train(data, n, 10, &codes, /*maxPointsPerCentroid=*/256);
+    if (!pq->trained() || codes.size() != static_cast<size_t>(n) * sub) return;
+
+    // e_i = ||x_i - decode(code_i)||, the exact reconstruction error. The filter
+    // is only sound because this is the TRUE per-vector error, not an estimate.
+    const int dsub = pq->dsub(), ksub = pq->ksub();
+    const std::vector<float>& cen = pq->centroids();
+    std::vector<float> err(n, 0.0f);
+    parallelFor(n, [&](int i) {
+        const float* x = data + static_cast<size_t>(i) * dim;
+        const uint8_t* c = &codes[static_cast<size_t>(i) * sub];
+        double acc = 0.0;
+        for (int mm = 0; mm < sub; ++mm) {
+            const float* ce = &cen[(static_cast<size_t>(mm) * ksub + c[mm]) * dsub];
+            const float* xs = x + static_cast<size_t>(mm) * dsub;
+            for (int d = 0; d < dsub; ++d) {
+                const double e = static_cast<double>(xs[d]) - ce[d];
+                acc += e * e;
+            }
+        }
+        err[i] = static_cast<float>(std::sqrt(acc));
+    });
+
+    // Transpose the codebook for the SIMD LUT build (see pqCenT).
+    std::vector<float> cenT(static_cast<size_t>(sub) * dsub * ksub);
+    for (int mm = 0; mm < sub; ++mm)
+        for (int j = 0; j < ksub; ++j)
+            for (int d = 0; d < dsub; ++d)
+                cenT[(static_cast<size_t>(mm) * dsub + d) * ksub + j] =
+                    cen[(static_cast<size_t>(mm) * ksub + j) * dsub + d];
+
+    m->pqCenT  = std::move(cenT);
+    m->pqNorm  = pq->norms();
+    m->pq      = std::move(pq);
+    m->pqCodes = std::move(codes);
+    m->pqErr   = std::move(err);
+    m->pqM     = sub;
+}
+
 
 // Cast the float db to fp16 and upload it + the int32 graph as GPU buffers.
 void GraphIndex::uploadGpu(Impl* m) {
@@ -462,11 +575,22 @@ bool GraphIndex::save(const char* path) const {
     if (!mImpl->ready) return false;
     FILE* f = std::fopen(path, "wb");
     if (!f) return false;
-    const int32_t hdr[6] = { 0x4d464752 /*'MFGR'*/, mImpl->dim, (int)mImpl->metric,
-                             mImpl->R, mImpl->dbCount, mImpl->entry };
-    bool ok = std::fwrite(hdr, sizeof(int32_t), 6, f) == 6
+    // 'MFG2' appends the traversal filter (pqM, codes, per-vector error, the
+    // transposed codebook + norms). Without it a loaded index would search the
+    // same but SLOWER than the one that was built — a silent perf cliff.
+    // pqM = 0 => no filter section (InnerProduct / dim too large / train failed).
+    const int32_t pqM = (mImpl->pq && !mImpl->pqCodes.empty()) ? mImpl->pqM : 0;
+    const int32_t hdr[7] = { 0x4d464732 /*'MFG2'*/, mImpl->dim, (int)mImpl->metric,
+                             mImpl->R, mImpl->dbCount, mImpl->entry, pqM };
+    bool ok = std::fwrite(hdr, sizeof(int32_t), 7, f) == 7
             && std::fwrite(mImpl->db.data(),    sizeof(float),   mImpl->db.size(),    f) == mImpl->db.size()
             && std::fwrite(mImpl->graph.data(), sizeof(int32_t), mImpl->graph.size(), f) == mImpl->graph.size();
+    if (ok && pqM > 0) {
+        ok = std::fwrite(mImpl->pqCodes.data(), 1, mImpl->pqCodes.size(), f) == mImpl->pqCodes.size()
+          && std::fwrite(mImpl->pqErr.data(),  sizeof(float), mImpl->pqErr.size(),  f) == mImpl->pqErr.size()
+          && std::fwrite(mImpl->pqCenT.data(), sizeof(float), mImpl->pqCenT.size(), f) == mImpl->pqCenT.size()
+          && std::fwrite(mImpl->pqNorm.data(), sizeof(float), mImpl->pqNorm.size(), f) == mImpl->pqNorm.size();
+    }
     std::fclose(f);
     return ok;
 }
@@ -475,13 +599,44 @@ bool GraphIndex::load(const char* path) {
     FILE* f = std::fopen(path, "rb");
     if (!f) return false;
     int32_t hdr[6];
-    if (std::fread(hdr, sizeof(int32_t), 6, f) != 6 || hdr[0] != 0x4d464752) { std::fclose(f); return false; }
+    if (std::fread(hdr, sizeof(int32_t), 6, f) != 6) { std::fclose(f); return false; }
+    const bool v2 = (hdr[0] == 0x4d464732 /*'MFG2'*/);
+    if (!v2 && hdr[0] != 0x4d464752 /*'MFGR' — pre-filter files still load*/) {
+        std::fclose(f); return false;
+    }
+    int32_t pqM = 0;
+    if (v2 && std::fread(&pqM, sizeof(int32_t), 1, f) != 1) { std::fclose(f); return false; }
     mImpl->dim = hdr[1]; mImpl->metric = (Metric)hdr[2]; mImpl->R = hdr[3];
     mImpl->dbCount = hdr[4]; mImpl->entry = hdr[5];
     mImpl->db.resize(static_cast<size_t>(mImpl->dbCount) * mImpl->dim);
     mImpl->graph.resize(static_cast<size_t>(mImpl->dbCount) * mImpl->R);
     bool ok = std::fread(mImpl->db.data(),    sizeof(float),   mImpl->db.size(),    f) == mImpl->db.size()
            && std::fread(mImpl->graph.data(), sizeof(int32_t), mImpl->graph.size(), f) == mImpl->graph.size();
+
+    mImpl->pq.reset();
+    mImpl->pqCodes.clear(); mImpl->pqErr.clear();
+    mImpl->pqCenT.clear();  mImpl->pqNorm.clear();
+    mImpl->pqM = 0;
+    if (ok && pqM > 0 && mImpl->dim % pqM == 0) {
+        auto pq = std::make_unique<detail::PqTrainer>(mImpl->dim, pqM);
+        const size_t nC = static_cast<size_t>(mImpl->dbCount) * pqM;
+        const size_t nT = static_cast<size_t>(pqM) * pq->dsub() * pq->ksub();
+        const size_t nN = static_cast<size_t>(pqM) * pq->ksub();
+        std::vector<uint8_t> codes(nC);
+        std::vector<float>   err(mImpl->dbCount), cenT(nT), nrm(nN);
+        ok = std::fread(codes.data(), 1, nC, f) == nC
+          && std::fread(err.data(),  sizeof(float), err.size(), f) == err.size()
+          && std::fread(cenT.data(), sizeof(float), nT, f) == nT
+          && std::fread(nrm.data(),  sizeof(float), nN, f) == nN;
+        if (ok) {
+            mImpl->pq      = std::move(pq);
+            mImpl->pqCodes = std::move(codes);
+            mImpl->pqErr   = std::move(err);
+            mImpl->pqCenT  = std::move(cenT);
+            mImpl->pqNorm  = std::move(nrm);
+            mImpl->pqM     = pqM;
+        }
+    }
     std::fclose(f);
     if (!ok) return false;
     mImpl->ready = true;
@@ -489,13 +644,155 @@ bool GraphIndex::load(const char* path) {
     return true;
 }
 
-// Dynamic best-first graph traversal (CPU) — the recall reference / fallback.
-static SearchResult searchCpu(const float* db, const int32_t* graph, int dim, int R,
+// Filter effectiveness counters (MFLAT_GRAPH_FILTERSTATS=1 prints the keep rate
+// at process exit) — a filter that rejects little is pure overhead, so this is
+// the number that decides whether the whole idea pays.
+std::atomic<long> gSeen{0}, gKept{0};
+struct FilterStats {
+    ~FilterStats() {
+        if (!std::getenv("MFLAT_GRAPH_FILTERSTATS")) return;
+        const long s = gSeen.load(), k = gKept.load();
+        if (s) std::fprintf(stderr, "[filter] neighbours %ld, rows fetched %ld (%.1f%% kept, %.1f%% skipped)\n",
+                            s, k, 100.0 * k / s, 100.0 * (s - k) / s);
+    }
+} gFilterStats;
+
+// Open-addressing visited set (id+1 stored, 0 = empty; linear probing, grows at
+// 50% load) — the CPU twin of the kernel's vhash. std::unordered_set was ~half
+// the single-query latency budget (hash + node allocations per insert).
+struct VisitedSet {
+    std::vector<int32_t> slots;
+    uint32_t mask  = 0;
+    uint32_t count = 0;
+    explicit VisitedSet(uint32_t cap) {
+        uint32_t h = 64; while (h < cap) h <<= 1;
+        slots.assign(h, 0); mask = h - 1;
+    }
+    bool insert(int id) {   // true if newly inserted
+        if ((count + 1) * 2 > slots.size()) grow();
+        uint32_t h = mix(static_cast<uint32_t>(id)) & mask;
+        for (;;) {
+            const int32_t s = slots[h];
+            if (s == 0)      { slots[h] = id + 1; ++count; return true; }
+            if (s == id + 1) return false;
+            h = (h + 1) & mask;
+        }
+    }
+    void grow() {
+        std::vector<int32_t> old;
+        old.swap(slots);
+        slots.assign(old.size() * 2, 0);
+        mask = static_cast<uint32_t>(slots.size()) - 1;
+        for (const int32_t s : old)
+            if (s) {
+                uint32_t h = mix(static_cast<uint32_t>(s - 1)) & mask;
+                while (slots[h]) h = (h + 1) & mask;
+                slots[h] = s;
+            }
+    }
+};
+
+// 4-accumulator metric score, local to the graph traversal hot path. The
+// Distance.h primitives accumulate serially by contract (bit-stable reference);
+// here the serial float dependency chain IS the bottleneck (one FMA latency per
+// element), and the graph CPU path is judged on recall, not bit-parity, so
+// independent chains (which clang then vectorizes) are fair game.
+static inline float score4(Metric metric, const float* a, const float* b, int dim) {
+    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    int c = 0;
+    if (metric == Metric::L2) {
+        for (; c + 4 <= dim; c += 4) {
+            const float e0 = a[c] - b[c],         e1 = a[c + 1] - b[c + 1];
+            const float e2 = a[c + 2] - b[c + 2], e3 = a[c + 3] - b[c + 3];
+            s0 += e0 * e0; s1 += e1 * e1; s2 += e2 * e2; s3 += e3 * e3;
+        }
+        float s = (s0 + s1) + (s2 + s3);
+        for (; c < dim; ++c) { const float e = a[c] - b[c]; s += e * e; }
+        return -s;
+    }
+    for (; c + 4 <= dim; c += 4) {
+        s0 += a[c] * b[c];         s1 += a[c + 1] * b[c + 1];
+        s2 += a[c + 2] * b[c + 2]; s3 += a[c + 3] * b[c + 3];
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    for (; c < dim; ++c) s += a[c] * b[c];
+    return s;
+}
+
+// Same, over the fp16 database. The graph traversal is MEMORY-bound — each hop
+// gathers R random rows, so a query touches thousands of scattered rows and the
+// single-core limit is bytes pulled, not FLOPs — and halving the row (fp32 ->
+// fp16) halves exactly that traffic. Reads the fp16 rows the GPU path already
+// stores (the shared MTLBuffer is CPU-addressable), so it costs no extra memory
+// and no extra conversion pass. fp16 storage with fp32 accumulation is the same
+// precision the GPU kernels use, and recall is unchanged (measured).
+static inline float score4H(Metric metric, const float* a, const __fp16* b, int dim) {
+    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    int c = 0;
+    if (metric == Metric::L2) {
+        for (; c + 4 <= dim; c += 4) {
+            const float e0 = a[c]     - static_cast<float>(b[c]);
+            const float e1 = a[c + 1] - static_cast<float>(b[c + 1]);
+            const float e2 = a[c + 2] - static_cast<float>(b[c + 2]);
+            const float e3 = a[c + 3] - static_cast<float>(b[c + 3]);
+            s0 += e0 * e0; s1 += e1 * e1; s2 += e2 * e2; s3 += e3 * e3;
+        }
+        float s = (s0 + s1) + (s2 + s3);
+        for (; c < dim; ++c) { const float e = a[c] - static_cast<float>(b[c]); s += e * e; }
+        return -s;
+    }
+    for (; c + 4 <= dim; c += 4) {
+        s0 += a[c]     * static_cast<float>(b[c]);
+        s1 += a[c + 1] * static_cast<float>(b[c + 1]);
+        s2 += a[c + 2] * static_cast<float>(b[c + 2]);
+        s3 += a[c + 3] * static_cast<float>(b[c + 3]);
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    for (; c < dim; ++c) s += a[c] * static_cast<float>(b[c]);
+    return s;
+}
+
+// Dynamic best-first graph traversal (CPU) — the recall reference / fallback,
+// and since the small-batch routing also the SINGLE-QUERY hot path. hnswlib-
+// style discipline: below-threshold candidates are never pushed to the
+// frontier (the threshold only rises, so they could never be expanded anyway
+// — identical traversal, far fewer heap ops), the visited check runs over a
+// parent's whole row before any scoring so the prefetches overlap the scores.
+static SearchResult searchCpu(const float* db, const __fp16* dbH,
+                              const int32_t* graph, int dim, int R,
                               int n, int entry, Metric metric,
-                              const float* queries, int m, int k, int L, int numStart) {
+                              const float* queries, int m, int k, int L, int numStart,
+                              int W, int pqM, int ksub,
+                              const uint8_t* codes, const float* err,
+                              const float* cenT, const float* pqNorm) {
     SearchResult out;
     out.ids.assign(static_cast<size_t>(m) * k, -1);
     out.distances.assign(static_cast<size_t>(m) * k, emptyValue(metric));
+
+    // LOSSLESS neighbour filter. The traversal is latency-bound on random row
+    // gathers (~30 per hop, each 4 cache lines from DRAM), NOT on FLOPs or
+    // bandwidth. ADC gives ||q - x̂||^2 exactly, and e_i = ||x_i - x̂_i|| is
+    // stored, so  ||q-x|| >= ||q-x̂|| - e_i  is a HARD lower bound. If that bound
+    // already loses to the beam's worst kept entry, the neighbour cannot make
+    // the beam and its row is never touched — we paid one SLC-resident code
+    // (16 B) instead of a 256 B DRAM row. Because the bound admits no false
+    // negatives, the beam sees exactly the same insertions as the unfiltered
+    // walk: identical results, identical recall, identical CPU/GPU parity.
+    const bool useFilter = pqM > 0 && codes && err && cenT && pqNorm
+                        && metric != Metric::InnerProduct;
+
+    // Score against the fp16 rows when they exist (halves the gathered bytes,
+    // which is what this traversal is actually limited by); fp32 otherwise.
+    const size_t rowB = dbH ? sizeof(__fp16) : sizeof(float);
+    auto rowAddr = [&](int id) -> const char* {
+        return (dbH ? reinterpret_cast<const char*>(dbH) : reinterpret_cast<const char*>(db))
+             + static_cast<size_t>(id) * dim * rowB;
+    };
+    auto scoreExact = [&](const float* q, int id) {
+        return dbH ? score4H(metric, q, dbH + static_cast<size_t>(id) * dim, dim)
+                   : score4(metric, q, db + static_cast<size_t>(id) * dim, dim);
+    };
+
 
     parallelFor(m, [&](int qi) {
         const float* qsrc = queries + static_cast<size_t>(qi) * dim;
@@ -503,41 +800,147 @@ static SearchResult searchCpu(const float* db, const int32_t* graph, int dim, in
         const float* q = qsrc;
         if (metric == Metric::Cosine) { qn.assign(qsrc, qsrc + dim); normalizeRows(qn, 1, dim); q = qn.data(); }
 
-        std::priority_queue<std::pair<float,int>,
-            std::vector<std::pair<float,int>>, std::greater<>> result;   // min-heap: worst on top
-        std::priority_queue<std::pair<float,int>> frontier;             // max-heap: best on top
-        std::unordered_set<int> visited;
-        visited.reserve(static_cast<size_t>(L) * 4);
+        // Per-query ADC table (pqM × 256 floats ≈ 16 KB — L1/L2-resident) and
+        // ||q||^2, which turns the table's sum into ||q - x̂||^2.
+        std::vector<float> lut;
+        float qNorm2 = 0.0f;
+        if (useFilter) {
+            const int dsub = dim / pqM;
+            lut.resize(static_cast<size_t>(pqM) * ksub);
+            // lut[mm][j] = ||c||^2 - 2 q_mm·c. With the transposed codebook this
+            // is dsub contiguous axpy passes over the 256 centroids — vectorized,
+            // vs a strided scalar dot per centroid (~5x faster, measured).
+            for (int mm = 0; mm < pqM; ++mm) {
+                float* o = &lut[static_cast<size_t>(mm) * ksub];
+                const float* nrm = pqNorm + static_cast<size_t>(mm) * ksub;
+                for (int j = 0; j < ksub; ++j) o[j] = nrm[j];
+                const float* qs = q + static_cast<size_t>(mm) * dsub;
+                for (int d = 0; d < dsub; ++d) {
+                    const float a = -2.0f * qs[d];
+                    const float* Ct = cenT + (static_cast<size_t>(mm) * dsub + d) * ksub;
+                    for (int j = 0; j < ksub; ++j) o[j] += a * Ct[j];
+                }
+            }
+            for (int c = 0; c < dim; ++c) qNorm2 += q[c] * q[c];
+        }
+        // Hard lower bound on the TRUE squared distance to `id`, or -1 when the
+        // filter is off. Reads one code (SLC) + one float — never the full row.
+        auto lowerBoundD2 = [&](int id) -> float {
+            const uint8_t* c = codes + static_cast<size_t>(id) * pqM;
+            float s = qNorm2;
+            for (int mm = 0; mm < pqM; ++mm) s += lut[static_cast<size_t>(mm) * ksub + c[mm]];
+            const float dHat = std::sqrt(std::max(0.0f, s));   // ||q - x̂|| (exact)
+            const float lb   = dHat - err[id];                 // triangle inequality
+            return lb > 0.0f ? lb * lb : 0.0f;
+        };
 
-        auto consider = [&](int id) {
-            if (id < 0 || !visited.insert(id).second) return;
-            const float s = score(metric, q, db + static_cast<size_t>(id) * dim, dim);
-            frontier.push({s, id});
-            if (static_cast<int>(result.size()) < L || s > result.top().first) {
-                result.push({s, id});
-                if (static_cast<int>(result.size()) > L) result.pop();
+        // ONE bounded, sorted beam instead of two heaps. The old shape kept a
+        // result min-heap plus an unbounded frontier max-heap and pushed every
+        // improving candidate to BOTH — but a candidate outside the top-L can
+        // never be expanded (the threshold only rises), so those pushes were
+        // pure overhead, and the frontier grew to thousands of entries whose
+        // heap traffic dominated the traversal. A flat array of L (score, id)
+        // held descending gives: expansion = the first unexpanded entry, the
+        // cutoff = beam[L-1], and insertion = one binary search + memmove of a
+        // few cache lines. Same traversal, same results, far less work.
+        struct Beam { float s; int id; bool exp; };
+        std::vector<Beam> beam;
+        beam.reserve(static_cast<size_t>(L) + 1);
+        VisitedSet visited(static_cast<uint32_t>(8 * L));
+
+        auto push = [&](float s, int id) {
+            const int sz = static_cast<int>(beam.size());
+            if (sz >= L && s <= beam[L - 1].s) return;          // cannot make the beam
+            int lo = 0, hi = sz;                                // descending by score
+            while (lo < hi) { const int mid = (lo + hi) >> 1;
+                             if (beam[mid].s > s) lo = mid + 1; else hi = mid; }
+            if (sz < L) beam.insert(beam.begin() + lo, Beam{s, id, false});
+            else {
+                std::memmove(&beam[lo + 1], &beam[lo], sizeof(Beam) * (L - 1 - lo));
+                beam[lo] = Beam{s, id, false};
             }
         };
 
-        consider(entry);
-        for (int s = 1; s < numStart; ++s)
-            consider(static_cast<int>(mix(static_cast<uint32_t>(qi) * 2654435761u + s) % n));
-
-        while (!frontier.empty()) {
-            auto [cs, cid] = frontier.top(); frontier.pop();
-            if (static_cast<int>(result.size()) >= L && cs < result.top().first) break;
-            const int32_t* row = graph + static_cast<size_t>(cid) * R;
-            for (int e = 0; e < R; ++e) consider(row[e]);
+        if (visited.insert(entry)) push(scoreExact(q, entry), entry);
+        for (int s = 1; s < numStart; ++s) {
+            const int id = static_cast<int>(mix(static_cast<uint32_t>(qi) * 2654435761u + s) % n);
+            if (visited.insert(id)) push(scoreExact(q, id), id);
         }
 
-        std::vector<std::pair<float,int>> best;
-        best.reserve(result.size());
-        while (!result.empty()) { best.push_back(result.top()); result.pop(); }
-        std::sort(best.begin(), best.end(), [](const auto& a, const auto& b){ return a.first > b.first; });
-        const int kk = std::min<int>(k, static_cast<int>(best.size()));
+        // Expand W beam nodes per iteration, not one. A single query's traversal
+        // is a SERIAL chain of dependent hops — each hop must finish its random
+        // row gathers before the next parent is known — so it is latency-bound,
+        // not bandwidth- or FLOP-bound (measured: halving the row to fp16 bought
+        // 14%, halving the degree bought nothing at iso-recall, removing the
+        // heaps bought nothing). Expanding W parents together issues W*R
+        // independent gathers at once, so the memory-level parallelism hides the
+        // latency the chain cannot. It costs some extra distance computations
+        // (nodes a strict best-first would have skipped) — a good trade exactly
+        // while latency, not throughput, is the binding constraint.
+        std::vector<int> parents;
+        parents.reserve(static_cast<size_t>(W));
+        std::vector<int> fresh;
+        fresh.reserve(static_cast<size_t>(W) * R);
+        for (;;) {
+            parents.clear();
+            for (int i = 0; i < static_cast<int>(beam.size()) && static_cast<int>(parents.size()) < W; ++i)
+                if (!beam[i].exp) { beam[i].exp = true; parents.push_back(beam[i].id); }
+            if (parents.empty()) break;                         // beam fully expanded
+
+            // Pass 1: collect this hop's unvisited neighbours and prefetch what
+            // the NEXT pass will read — the codes (one line each) when filtering,
+            // else the rows straight away.
+            fresh.clear();
+            for (const int parent : parents) {
+                const int32_t* row = graph + static_cast<size_t>(parent) * R;
+                for (int e = 0; e < R; ++e) {
+                    const int id = row[e];
+                    if (id >= 0 && visited.insert(id)) {
+                        fresh.push_back(id);
+                        if (useFilter) {
+                            __builtin_prefetch(codes + static_cast<size_t>(id) * pqM);
+                            __builtin_prefetch(err + id);
+                        } else {
+                            // Row is 1-2 cache lines; issue both.
+                            const char* p = rowAddr(id);
+                            __builtin_prefetch(p);
+                            __builtin_prefetch(p + 64);
+                        }
+                    }
+                }
+            }
+
+            // Pass 2 (filtered): drop the neighbours that PROVABLY cannot make
+            // the beam, and prefetch full rows only for the survivors — so the
+            // expensive DRAM gathers are issued only where they can matter.
+            if (useFilter && static_cast<int>(beam.size()) >= L) {
+                const float worstD2 = -beam[L - 1].s;   // beam holds -d^2
+                int w = 0;
+                for (const int id : fresh)
+                    if (lowerBoundD2(id) <= worstD2) {
+                        fresh[w++] = id;
+                        const char* p = rowAddr(id);
+                        __builtin_prefetch(p);
+                        __builtin_prefetch(p + 64);
+                    }
+                gSeen.fetch_add(fresh.size(), std::memory_order_relaxed);
+                gKept.fetch_add(w, std::memory_order_relaxed);
+                fresh.resize(w);
+            }
+
+            // Pass 3: exact score for everything that survived. The beam only
+            // ever holds exact distances, so the walk is the same walk.
+            for (const int id : fresh) {
+                const float s = scoreExact(q, id);
+                if (static_cast<int>(beam.size()) >= L && s <= beam[L - 1].s) continue;
+                push(s, id);
+            }
+        }
+
+        const int kk = std::min<int>(k, static_cast<int>(beam.size()));
         for (int i = 0; i < kk; ++i) {
-            out.ids[static_cast<size_t>(qi) * k + i]       = best[i].second;
-            out.distances[static_cast<size_t>(qi) * k + i] = scoreToValue(metric, best[i].first);
+            out.ids[static_cast<size_t>(qi) * k + i]       = beam[i].id;
+            out.distances[static_cast<size_t>(qi) * k + i] = scoreToValue(metric, beam[i].s);
         }
     });
     return out;
@@ -633,13 +1036,26 @@ SearchResult GraphIndex::search(const float* queries, int m, int k, int L, int m
     // running it strided (tgs < Lc) desyncs score/id and corrupts results, so the
     // GPU path needs a threadgroup of at least Lc threads. Fall back to CPU when
     // Lc exceeds the device's max threadgroup, or the pipeline is unavailable.
-    const bool forceCpu = std::getenv("MFLAT_GRAPH_CPU") != nullptr;
+    //
+    // Small batches also route to the CPU: the kernel runs ONE threadgroup per
+    // query, so the GPU is dispatch-latency-bound until ~a hundred queries are
+    // in flight, and the dynamic best-first CPU search is measured 3-14x faster
+    // there at IDENTICAL recall (m=1 L=64: 0.21 vs 2.97 ms; crossover m≈96-128
+    // across L=32..128 on SIFT1M — temp/graph_latency.mm). MFLAT_GRAPH_CPU=1/0
+    // forces the CPU/GPU path.
+    bool cpuRoute = (m < 96);
+    if (const char* e = std::getenv("MFLAT_GRAPH_CPU")) cpuRoute = (e[0] != '0');
     const NSUInteger maxT = mImpl->pipe ? mImpl->pipe.maxTotalThreadsPerThreadgroup : 0;
-    const bool gpu = !forceCpu && mImpl->pipe && mImpl->dbBuf && k <= kMaxK
+    const bool gpu = !cpuRoute && mImpl->pipe && mImpl->dbBuf && k <= kMaxK
                    && tgMem < 30000 && Lc <= maxT;
     if (!gpu)
-        return searchCpu(mImpl->db.data(), mImpl->graph.data(), dim, R, n, entry,
-                         metric, queries, m, k, L, numStart);
+        return searchCpu(mImpl->db.data(), mImpl->dbHalfCpu(), mImpl->graph.data(),
+                         dim, R, n, entry, metric, queries, m, k, L, numStart, W,
+                         mImpl->pqM, mImpl->pq ? mImpl->pq->ksub() : 256,
+                         mImpl->pqCodes.empty() ? nullptr : mImpl->pqCodes.data(),
+                         mImpl->pqErr.empty()   ? nullptr : mImpl->pqErr.data(),
+                         mImpl->pqCenT.empty()  ? nullptr : mImpl->pqCenT.data(),
+                         mImpl->pqNorm.empty()  ? nullptr : mImpl->pqNorm.data());
 
     out.ids.assign(static_cast<size_t>(m) * k, -1);
     out.distances.assign(static_cast<size_t>(m) * k, emptyValue(metric));
