@@ -650,7 +650,11 @@ IvfIndex::Impl::dispatchTiled(const float* qPtr, const std::vector<int32_t>& pro
         mp.k = (uint32_t)k; mp.nprobe = (uint32_t)nprobe;
         mp.metric = (uint32_t)metric; mp.queryCount = (uint32_t)m;
 
-        id<MTLCommandBuffer>         cb  = [queue commandBuffer];
+        // commandBufferWithUnretainedReferences: skip per-resource retain/release —
+        // measurable at m=1 where the fixed dispatch cost IS the latency. Safe
+        // because every bound buffer is index-owned or persistent scratch
+        // (GpuScratch.h) and search() awaits completion before returning.
+        id<MTLCommandBuffer>         cb  = [queue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 
         // Phase 1 — partial top-k per (query, probe). Metal's hazard tracking
@@ -720,7 +724,11 @@ IvfIndex::Impl::dispatchScan(const float* qPtr, const int32_t* probedPtr,
         p.metric     = static_cast<uint32_t>(metric);
         p.queryCount = static_cast<uint32_t>(mG);
 
-        id<MTLCommandBuffer>         cb  = [queue commandBuffer];
+        // commandBufferWithUnretainedReferences: skip per-resource retain/release —
+        // measurable at m=1 where the fixed dispatch cost IS the latency. Safe
+        // because every bound buffer is index-owned or persistent scratch
+        // (GpuScratch.h) and search() awaits completion before returning.
+        id<MTLCommandBuffer>         cb  = [queue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:scanPipe];
         [enc setBuffer:dbBuf   offset:0 atIndex:0];
