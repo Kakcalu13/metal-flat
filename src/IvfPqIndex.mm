@@ -30,6 +30,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -47,6 +48,7 @@
 #include "CoarseQuantizer.h"
 #include "TopkMsl.h"     // kTopkMslSrc + nextPow2K/topkScratchBytes (shared reduction)
 #include "GpuScratch.h"  // persistent per-search buffers (no alloc per query)
+#include "FastScan.h"    // 4-bit fast-scan ADC (NEON vqtbl1q_u8; CPU shortlist path)
 #include "Opq.h"
 
 namespace mflat {
@@ -268,18 +270,35 @@ struct IvfPqIndex::Impl {
     std::vector<uint8_t> reorderedCodes;  // dbCount × m (payload, CSR slot order)
 
     bool                 storeFull = false;  // keep full vectors for reranking
-    std::vector<float>   fullById;           // dbCount × dim, ORIGINAL id order
-                                             // (rotated space when OPQ is on)
+    std::vector<__fp16>  fullById;           // dbCount × dim, ORIGINAL id order,
+                                             // fp16 (rotated space when OPQ on).
+                                             // fp16, not fp32: the rerank is a
+                                             // random DRAM gather of these rows,
+                                             // so halving the bytes ~halves its
+                                             // cost — and fp16 preserves ranking,
+                                             // so recall is unchanged.
 
     bool               residual = true;      // requested: PQ on x - coarse_centroid
     bool               opq      = false;     // requested: learned rotation pre-transform
+    bool               fastScan = false;     // requested: 4-bit fast-scan codes (CPU scan)
     // Latched at build(): what the CURRENT index actually contains. search()
     // consults ONLY these — toggling the setters after build() cannot corrupt
     // an already-built index (it applies to the next build()).
     bool               residualActive = true;
     bool               opqActive      = false;
+    bool               fastScanActive = false;
     std::vector<float> opqR;                 // dim × dim rotation (row-major)
     std::vector<float> precomp;              // nlist × m × 256 residual ADC table
+
+    // 4-bit fast-scan state (fastScanActive): m4 = 2*m subquantizers of 16
+    // centroids — same bytes/vector, two codes per byte. Codes live in the
+    // blocked nibble layout (FastScan.h); ids are per-cell padded to blocks.
+    std::unique_ptr<detail::PqTrainer> pq4;
+    std::vector<uint8_t>  fsCodes;       // sum(blocks) × m4 × 16
+    std::vector<int32_t>  fsIds;         // sum(blocks) × 32, -1 padded
+    std::vector<int>      fsBlockStart;  // per cell, first block index
+    std::vector<float>    fsPrecomp;     // nlist × m4 × 16 (residual)
+    int                   m4 = 0;
 
     id<MTLDevice>               device     = nil;
     id<MTLCommandQueue>         queue      = nil;
@@ -338,6 +357,7 @@ IvfPqIndex::~IvfPqIndex() = default;
 void IvfPqIndex::setRerank(bool enable)   { mImpl->storeFull = enable; }
 void IvfPqIndex::setResidual(bool enable) { mImpl->residual  = enable; }
 void IvfPqIndex::setOpq(bool enable)      { mImpl->opq       = enable; }
+void IvfPqIndex::setFastScan(bool enable)  { mImpl->fastScan  = enable; }
 
 int IvfPqIndex::dim()           const { return mImpl->dim; }
 int IvfPqIndex::size()          const { return mImpl->dbCount; }
@@ -348,6 +368,18 @@ bool IvfPqIndex::ready()        const { return mImpl->ready; }
 void IvfPqIndex::build(const float* vectors, int n) {
     if (n <= 0 || mImpl->dim <= 0 || mImpl->m <= 0 || mImpl->dim % mImpl->m != 0) return;
     const int dim = mImpl->dim, M = mImpl->m;
+
+    // Per-stage build timing (INFO): the build is a benchmark talking point, so
+    // report where the time goes rather than re-deriving it with a profiler.
+    using Clock = std::chrono::steady_clock;
+    auto tick = Clock::now();
+    auto lap  = [&tick] {
+        const auto now = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - tick).count();
+        tick = now;
+        return ms;
+    };
+    double tOpq = 0, tCoarse = 0, tResid = 0, tPq = 0, tCell = 0, tGpu = 0;
 
     std::vector<float> data(vectors, vectors + static_cast<size_t>(n) * dim);
     if (mImpl->metric == Metric::Cosine) normalizeRows(data, n, dim);
@@ -373,22 +405,33 @@ void IvfPqIndex::build(const float* vectors, int n) {
             });
             sPtr = sample.data();
         }
-        mImpl->opqR = trainOpqRotation(sPtr, ns, dim, M);
+        int opqIters = 20;   // MFLAT_OPQ_ITERS overrides (build-cost tuning)
+        if (const char* e = std::getenv("MFLAT_OPQ_ITERS")) opqIters = std::max(1, atoi(e));
+        mImpl->opqR = trainOpqRotation(sPtr, ns, dim, M, opqIters);
         std::vector<float> rotated(data.size());
         applyRotation(mImpl->opqR.data(), data.data(), rotated.data(), n, dim);
         data.swap(rotated);
     } else {
         mImpl->opqR.clear();
     }
+    tOpq = lap();
 
     // Coarse quantizer FIRST (residual encoding needs the cell assignment).
     mImpl->cq->train(data.data(), n, mImpl->nlist, kIters,
                      CoarseQuantizer::KmeansBackend::ForceGpuAssign);
     mImpl->nlist = mImpl->cq->nlist();
+    tCoarse = lap();
 
     // Keep full vectors (original id order; rotated space when OPQ) for exact
     // reranking — snapshot BEFORE the residual subtraction below.
-    if (mImpl->storeFull) mImpl->fullById = data;
+    if (mImpl->storeFull) {
+        mImpl->fullById.resize(static_cast<size_t>(n) * dim);
+        parallelFor(n, [&](int i) {
+            const float* src = &data[static_cast<size_t>(i) * dim];
+            __fp16*      dst = &mImpl->fullById[static_cast<size_t>(i) * dim];
+            for (int c = 0; c < dim; ++c) dst[c] = static_cast<__fp16>(src[c]);
+        });
+    }
 
     // Residual mode: PQ quantizes r = x - coarse_centroid(x). Residuals are
     // much smaller than raw vectors, so the same m bytes carry far more
@@ -407,31 +450,92 @@ void IvfPqIndex::build(const float* vectors, int n) {
             for (int d = 0; d < dim; ++d) v[d] -= c[d];
         });
     }
+    tResid = lap();
 
-    // PQ training on residuals (or raw vectors when residual is off); codes
-    // come straight from the sub-space k-means assignment (bit-exact).
-    std::vector<uint8_t> codes(static_cast<size_t>(n) * M);
-    mImpl->pq->train(data.data(), n, kIters, &codes);
+    // 4-bit fast-scan: m4 = 2*M subquantizers of 16 centroids — SAME bytes per
+    // vector (two codes per byte), but the per-subq LUT fits one NEON register
+    // so the CPU scan is table-lookup-per-instruction (FastScan.h). Falls back
+    // to the 8-bit path when dim isn't divisible (the mode is latched OFF, so
+    // search() consults reality, not the request).
+    const bool wantFs = mImpl->fastScan && (dim % (2 * M) == 0);
+    if (mImpl->fastScan && !wantFs)
+        MFLAT_LOG_WARN("ivfpq fastscan: dim %d %% (2*m=%d) != 0 — using 8-bit codes",
+                       dim, 2 * M);
 
-    // Reorder the m-byte codes into CSR slot order (id order -> slots).
-    mImpl->reorderedCodes.assign(static_cast<size_t>(n) * M, 0);
-    mImpl->cq->reorderPayload(codes.data(), mImpl->reorderedCodes.data(),
-                              static_cast<size_t>(M));
+    if (wantFs) {
+        const int m4 = 2 * M;
+        mImpl->m4  = m4;
+        mImpl->pq4 = std::make_unique<detail::PqTrainer>(dim, m4, detail::kFsKsub);
+        std::vector<uint8_t> codes4(static_cast<size_t>(n) * m4);
+        mImpl->pq4->train(data.data(), n, kIters, &codes4, /*maxPointsPerCentroid=*/256);
 
-    // Residual ADC cross table T[cell][mm][j] = 2 c·pqc (see kernel comment).
-    if (mImpl->residual) {
-        mImpl->precomp.assign(static_cast<size_t>(mImpl->nlist) * mImpl->pq->lutSize(), 0.0f);
-        mImpl->pq->buildCellTable(mImpl->cq->centroids().data(), mImpl->nlist,
-                                  mImpl->precomp.data());
-    } else {
+        // CSR slot order, then per-cell blocked nibble packing + padded ids.
+        std::vector<uint8_t> csr(static_cast<size_t>(n) * m4);
+        mImpl->cq->reorderPayload(codes4.data(), csr.data(), static_cast<size_t>(m4));
+        const std::vector<int>& cs  = mImpl->cq->cellStart();
+        const std::vector<int>& rid = mImpl->cq->reorderedIds();
+        mImpl->fsBlockStart.assign(mImpl->nlist + 1, 0);
+        for (int c = 0; c < mImpl->nlist; ++c)
+            mImpl->fsBlockStart[c + 1] = mImpl->fsBlockStart[c]
+                                       + detail::fsBlocksFor(cs[c + 1] - cs[c]);
+        const int totalBlk = mImpl->fsBlockStart[mImpl->nlist];
+        mImpl->fsCodes.assign(static_cast<size_t>(totalBlk) * m4 * 16, 0);
+        mImpl->fsIds.assign(static_cast<size_t>(totalBlk) * detail::kFsBlock, -1);
+        parallelFor(mImpl->nlist, [&](int c) {
+            const int lo = cs[c], count = cs[c + 1] - cs[c];
+            if (count <= 0) return;
+            detail::fsPackCell(&csr[static_cast<size_t>(lo) * m4], count, m4,
+                               &mImpl->fsCodes[static_cast<size_t>(mImpl->fsBlockStart[c]) * m4 * 16]);
+            int32_t* ids = &mImpl->fsIds[static_cast<size_t>(mImpl->fsBlockStart[c]) * detail::kFsBlock];
+            for (int t = 0; t < count; ++t) ids[t] = rid[lo + t];
+        });
+
+        if (mImpl->residual) {
+            mImpl->fsPrecomp.assign(static_cast<size_t>(mImpl->nlist) * mImpl->pq4->lutSize(), 0.0f);
+            mImpl->pq4->buildCellTable(mImpl->cq->centroids().data(), mImpl->nlist,
+                                       mImpl->fsPrecomp.data());
+        } else {
+            mImpl->fsPrecomp.clear();
+        }
+        // No 8-bit codes and no GPU upload: fast-scan is the CPU shortlist path
+        // (the GPU only ever served kRun <= 16 raw-ADC configs, none of which
+        // sit on the high-recall Pareto this mode exists for).
+        mImpl->reorderedCodes.clear();
         mImpl->precomp.clear();
+        mImpl->codesBuf = nil; mImpl->pqcBuf = nil; mImpl->pqnBuf = nil;
+        mImpl->precompBuf = nil;
+    } else {
+        // PQ training on residuals (or raw vectors when residual is off); codes
+        // come straight from the sub-space k-means assignment (bit-exact).
+        std::vector<uint8_t> codes(static_cast<size_t>(n) * M);
+        mImpl->pq->train(data.data(), n, kIters, &codes);
+
+        // Reorder the m-byte codes into CSR slot order (id order -> slots).
+        mImpl->reorderedCodes.assign(static_cast<size_t>(n) * M, 0);
+        mImpl->cq->reorderPayload(codes.data(), mImpl->reorderedCodes.data(),
+                                  static_cast<size_t>(M));
+
+        tPq = lap();
+        // Residual ADC cross table T[cell][mm][j] = 2 c·pqc (see kernel comment).
+        if (mImpl->residual) {
+            mImpl->precomp.assign(static_cast<size_t>(mImpl->nlist) * mImpl->pq->lutSize(), 0.0f);
+            mImpl->pq->buildCellTable(mImpl->cq->centroids().data(), mImpl->nlist,
+                                      mImpl->precomp.data());
+        } else {
+            mImpl->precomp.clear();
+        }
+        tCell = lap();
+        mImpl->pq4.reset();
+        mImpl->fsCodes.clear(); mImpl->fsIds.clear(); mImpl->fsBlockStart.clear();
+        mImpl->fsPrecomp.clear();
+        mImpl->m4 = 0;
     }
 
     mImpl->dbCount = n;
     mImpl->ready   = true;
 
     // GPU setup: upload codes + PQ tables (cell/id buffers live in the CQ).
-    if (mImpl->adcPipe && mImpl->cq->gpuReady()) {
+    if (!wantFs && mImpl->adcPipe && mImpl->cq->gpuReady()) {
         auto buf = [&](const void* p, size_t bytes) {
             return [mImpl->device newBufferWithBytes:p length:bytes
                                              options:MTLResourceStorageModeShared];
@@ -443,10 +547,16 @@ void IvfPqIndex::build(const float* vectors, int n) {
             ? buf(mImpl->precomp.data(), mImpl->precomp.size() * sizeof(float))
             : nil;
     }
+    tGpu = lap();
 
     // Latch the mode flags this index was actually built with (see Impl).
     mImpl->residualActive = mImpl->residual;
     mImpl->opqActive      = mImpl->opq;
+    mImpl->fastScanActive = wantFs;
+    MFLAT_LOG_INFO("ivfpq build: opq %.0f, coarse %.0f, residual %.0f, pq-train "
+                   "%.0f, cell-table %.0f, gpu-upload %.0f ms (n=%d nlist=%d m=%d "
+                   "opq=%d fs=%d)", tOpq, tCoarse, tResid, tPq, tCell, tGpu,
+                   n, mImpl->nlist, M, mImpl->opq, wantFs);
 }
 
 namespace {
@@ -592,6 +702,143 @@ void searchCpu(int dim, const CoarseQuantizer& cq,
     });
 }
 
+// 4-bit fast-scan CPU shortlist (see FastScan.h). Same shape as searchCpu —
+// slice-scanner + cell-parallel small batches — but the inner loop scores 32
+// candidates per pass with register-resident 16-entry LUTs (NEON vqtbl1q_u8)
+// instead of a scalar gather per code byte. Shortlist ordering uses QUANTIZED
+// distances (u8 LUT entries, u16 sums); the exact rerank repairs the rounding,
+// exactly as it already repairs the 4-bit quantization itself.
+void searchCpuFS(int dim, const CoarseQuantizer& cq, const detail::PqTrainer& pq4,
+                 const std::vector<uint8_t>& fsCodes,
+                 const std::vector<int>&     fsBlockStart,
+                 const std::vector<int32_t>& fsIds,
+                 bool residual, const std::vector<float>& fsPrecomp,
+                 const float* qPtr, int m, int k, int nprobe, SearchResult& out) {
+    const int m4 = pq4.m();
+    const size_t lutN = static_cast<size_t>(pq4.lutSize());   // m4 * 16
+    const std::vector<int>&   cellStart = cq.cellStart();
+    const std::vector<float>& cent      = cq.centroids();
+
+    auto insertTopk = [&](float s, int id, std::vector<float>& bestScore,
+                          std::vector<int>& bestId) {
+        int pos = 0;
+        while (pos + 1 < k && s > bestScore[pos + 1]) {
+            bestScore[pos] = bestScore[pos + 1];
+            bestId[pos]    = bestId[pos + 1];
+            ++pos;
+        }
+        bestScore[pos] = s;
+        bestId[pos]    = id;
+    };
+
+    // Scan probe-list slice [ppLo, ppHi). lut = the query's float LUT; lutc and
+    // lq are per-thread scratch (residual combine + quantized table).
+    auto scanSlice = [&](const float* q, const int* cells, int ppLo, int ppHi,
+                         const float* lut, float* lutc, uint8_t* lq,
+                         std::vector<float>& bestScore, std::vector<int>& bestId) {
+        for (int pp = ppLo; pp < ppHi; ++pp) {
+            const int c = cells[pp];
+            if (c < 0) continue;
+            const int count = cellStart[c + 1] - cellStart[c];
+            if (count <= 0) continue;
+
+            float base = 0.0f;
+            const float* useLut = lut;
+            if (residual) {
+                base = sqL2(q, &cent[static_cast<size_t>(c) * dim], dim);
+                const float* Tc = &fsPrecomp[static_cast<size_t>(c) * lutN];
+                for (size_t e = 0; e < lutN; ++e) lutc[e] = lut[e] + Tc[e];
+                useLut = lutc;
+            }
+            float scale, bias;
+            detail::fsQuantizeLut(useLut, m4, lq, &scale, &bias);
+
+            const uint8_t* blocks = &fsCodes[static_cast<size_t>(fsBlockStart[c]) * m4 * 16];
+            const int32_t* ids    = &fsIds[static_cast<size_t>(fsBlockStart[c]) * detail::kFsBlock];
+            const int nBlk = detail::fsBlocksFor(count);
+            uint16_t d16[detail::kFsBlock];
+            for (int b = 0; b < nBlk; ++b) {
+                const uint16_t mn = detail::fsScanBlock(
+                    blocks + static_cast<size_t>(b) * m4 * 16, lq, m4, d16);
+                // Block-level early-out: nothing here can beat the worst kept.
+                // bestScore holds -dist, so worst kept dist = -bestScore[0].
+                const bool  full   = bestId[0] >= 0;
+                const float worstD = -bestScore[0];
+                if (full && base + static_cast<float>(mn) / scale + bias >= worstD)
+                    continue;
+                const int32_t* bid = ids + static_cast<size_t>(b) * detail::kFsBlock;
+                for (int t = 0; t < detail::kFsBlock; ++t) {
+                    const int id = bid[t];
+                    if (id < 0) continue;
+                    const float dist = base + static_cast<float>(d16[t]) / scale + bias;
+                    const float s = -dist;
+                    if (s > bestScore[0]) insertTopk(s, id, bestScore, bestId);
+                }
+            }
+        }
+    };
+    auto emit = [&](int qi, const float* q, const std::vector<float>& bestScore,
+                    const std::vector<int>& bestId) {
+        const float qn = residual ? 0.0f : dot(q, q, dim);
+        for (int i = 0; i < k; ++i) {
+            const int src = k - 1 - i;
+            const size_t o = static_cast<size_t>(qi) * k + i;
+            out.ids[o]       = bestId[src];
+            out.distances[o] = -bestScore[src] + qn;
+        }
+    };
+
+    const int nt = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    if (m < nt && nprobe > 1) {
+        // Small batches: parallelise across CELLS (see searchCpu — same bug fix).
+        for (int qi = 0; qi < m; ++qi) {
+            const float* q = qPtr + static_cast<size_t>(qi) * dim;
+            std::vector<float> lut(lutN);
+            pq4.buildAdcTable(q, lut.data());
+            std::vector<int> cells(nprobe);
+            cq.probeCellsCpu(q, nprobe, cells.data());
+
+            const int slices = std::min(nt, nprobe);
+            std::vector<std::vector<float>> pScore(slices,
+                std::vector<float>(k, -std::numeric_limits<float>::infinity()));
+            std::vector<std::vector<int>> pId(slices, std::vector<int>(k, -1));
+            std::vector<std::vector<float>>   pLutc(slices, std::vector<float>(residual ? lutN : 0));
+            std::vector<std::vector<uint8_t>> pLq(slices, std::vector<uint8_t>(lutN));
+            const int chunk = (nprobe + slices - 1) / slices;
+            parallelFor(slices, [&](int t) {
+                const int lo = t * chunk, hi = std::min(nprobe, lo + chunk);
+                if (lo < hi)
+                    scanSlice(q, cells.data(), lo, hi, lut.data(),
+                              residual ? pLutc[t].data() : nullptr, pLq[t].data(),
+                              pScore[t], pId[t]);
+            });
+            std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
+            std::vector<int>   bestId(k, -1);
+            for (int t = 0; t < slices; ++t)
+                for (int e = 0; e < k; ++e)
+                    if (pId[t][e] >= 0 && pScore[t][e] > bestScore[0])
+                        insertTopk(pScore[t][e], pId[t][e], bestScore, bestId);
+            emit(qi, q, bestScore, bestId);
+        }
+        return;
+    }
+
+    parallelFor(m, [&](int qi) {
+        const float* q = qPtr + static_cast<size_t>(qi) * dim;
+        std::vector<float> lut(lutN);
+        pq4.buildAdcTable(q, lut.data());
+        std::vector<float>   lutc(residual ? lutN : 0);
+        std::vector<uint8_t> lq(lutN);
+        std::vector<int> cells(nprobe);
+        cq.probeCellsCpu(q, nprobe, cells.data());
+        std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
+        std::vector<int>   bestId(k, -1);
+        scanSlice(q, cells.data(), 0, nprobe, lut.data(),
+                  residual ? lutc.data() : nullptr, lq.data(), bestScore, bestId);
+        emit(qi, q, bestScore, bestId);
+    });
+}
+
 }  // namespace
 
 // GPU ADC PQ search producing the kRun-NN shortlist. qPtr is already
@@ -673,7 +920,11 @@ void IvfPqIndex::Impl::runPqGpu(const float* qPtr, int m, int kRun,
         }
         p.tgLut = tgLut ? 1u : 0u;
 
-        id<MTLCommandBuffer>         cb  = [queue commandBuffer];
+        // commandBufferWithUnretainedReferences: skip per-resource retain/release —
+        // measurable at m=1 where the fixed dispatch cost IS the latency. Safe
+        // because every bound buffer is index-owned or persistent scratch
+        // (GpuScratch.h) and search() awaits completion before returning.
+        id<MTLCommandBuffer>         cb  = [queue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:adcPipe];
         [enc setBuffer:codesBuf offset:0 atIndex:0];
@@ -713,7 +964,12 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
     if (m <= 0 || !mImpl->ready) return out;
     const int dim = mImpl->dim, nlist = mImpl->nlist;
     if (k < 1) k = 1;
-    if (k > kMaxK) k = kMaxK;
+    // k > kMaxK is NOT clamped: the GPU ADC's per-thread top-k is a fixed
+    // kMaxK-sized register array, so large k simply routes to the exact CPU ADC
+    // below (searchCpu serves any k), exactly as FlatIndex/IvfIndex/GraphIndex
+    // do. This used to silently truncate — ask for k=100, get 64 back — which
+    // reads as a correctness bug, not a documented limit. k=100 is a standard
+    // ann-benchmarks configuration.
     if (nprobe < 1) nprobe = 1;
     if (nprobe > nlist) nprobe = nlist;
 
@@ -756,9 +1012,15 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
     // MFLAT_PQ_CPU=1/0 forces the CPU/GPU path.
     bool cpuRoute = (kRun > 16) || (m <= 4);
     if (const char* e = std::getenv("MFLAT_PQ_CPU")) cpuRoute = (e[0] == '1');
-    const bool useGpu = !cpuRoute && mImpl->adcPipe && mImpl->cq->gpuReady() && kRun <= kMaxK;
+    const bool useGpu = !mImpl->fastScanActive && !cpuRoute
+                      && mImpl->adcPipe && mImpl->cq->gpuReady() && kRun <= kMaxK;
     if (useGpu) {
         mImpl->runPqGpu(qPtr, m, kRun, nprobe, pq);
+    } else if (mImpl->fastScanActive) {
+        searchCpuFS(dim, *mImpl->cq, *mImpl->pq4, mImpl->fsCodes,
+                    mImpl->fsBlockStart, mImpl->fsIds,
+                    mImpl->residualActive, mImpl->fsPrecomp,
+                    qPtr, m, kRun, nprobe, pq);
     } else {
         searchCpu(dim, *mImpl->cq, *mImpl->pq, mImpl->reorderedCodes,
                   mImpl->residualActive, mImpl->precomp,
@@ -770,18 +1032,27 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
     // ---- exact rerank of the shortlist down to the true top-k -----------
     out.ids.assign(static_cast<size_t>(m) * k, -1);
     out.distances.assign(static_cast<size_t>(m) * k, std::numeric_limits<float>::infinity());
-    const std::vector<float>& full = mImpl->fullById;   // exact rerank vectors
+    const std::vector<__fp16>& full = mImpl->fullById;   // fp16 rerank vectors
+    const Metric metric = mImpl->metric;
+    constexpr int kPref = 8;                              // rerank prefetch depth
     parallelFor(m, [&](int qi) {
         const float* q = qPtr + static_cast<size_t>(qi) * dim;
+        const int32_t* sl = &pq.ids[static_cast<size_t>(qi) * kRun];
         std::vector<float> bestScore(k, -std::numeric_limits<float>::infinity());
         std::vector<int>   bestId(k, -1);
+        // Prime the gather pipeline: the rerank rows are random 256 B fetches
+        // from a ~128 MB array, so run the prefetcher kPref candidates ahead.
+        for (int p = 0; p < kPref && p < kRun; ++p)
+            if (sl[p] >= 0) __builtin_prefetch(&full[static_cast<size_t>(sl[p]) * dim]);
         for (int sIdx = 0; sIdx < kRun; ++sIdx) {
-            const int id = pq.ids[static_cast<size_t>(qi) * kRun + sIdx];
+            if (sIdx + kPref < kRun && sl[sIdx + kPref] >= 0)
+                __builtin_prefetch(&full[static_cast<size_t>(sl[sIdx + kPref]) * dim]);
+            const int id = sl[sIdx];
             if (id < 0) continue;
-            const float* d = &full[static_cast<size_t>(id) * dim];
-            // scoreFast: 4 independent accumulators (the serial-accumulation
-            // reference stalls this tight rerank loop on its dependency chain).
-            const float s = detail::scoreFast(mImpl->metric, q, d, dim);
+            const __fp16* d = &full[static_cast<size_t>(id) * dim];
+            // scoreFastH: 4 accumulators over fp16 rows (half the gather traffic;
+            // the reference serial-accum path would stall this tight loop).
+            const float s = detail::scoreFastH(metric, q, d, dim);
             if (s > bestScore[0]) {
                 int pos = 0;
                 while (pos + 1 < k && s > bestScore[pos + 1]) {
@@ -797,7 +1068,7 @@ SearchResult IvfPqIndex::search(const float* queries, int m, int k, int nprobe, 
             const int src = k - 1 - i;
             const size_t o = static_cast<size_t>(qi) * k + i;
             out.ids[o]       = bestId[src];
-            out.distances[o] = detail::scoreToValue(mImpl->metric, bestScore[src]);
+            out.distances[o] = detail::scoreToValue(metric, bestScore[src]);
         }
     });
     return out;
