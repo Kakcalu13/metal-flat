@@ -75,6 +75,17 @@ public:
     // Latched at build(): calling after build() only affects the NEXT build().
     void setOpq(bool enable);
 
+    // 4-bit fast-scan codes (default OFF): 2*m subquantizers of 16 centroids —
+    // the SAME m bytes per vector, but each 16-entry lookup table fits one
+    // 128-bit SIMD register, so the CPU ADC scores 32 candidates per pass
+    // (NEON vqtbl1q_u8) instead of one scalar table load per code byte. This
+    // targets the high-recall rerank configs, whose shortlists run on the CPU.
+    // Shortlist ordering uses quantized (u8-LUT) distances; the exact rerank
+    // repairs the rounding. Requires dim % (2*m) == 0 (else falls back to
+    // 8-bit with a warning); the fast-scan shortlist path is CPU-only.
+    // Latched at build(): calling after build() only affects the NEXT build().
+    void setFastScan(bool enable);
+
     // Train (coarse k-means + per-subspace PQ k-means), encode every vector
     // to an m-byte code, and arrange the codes into per-cell inverted lists.
     // `n` row-major vectors (n * dim floats). One-time, O(n) memory in codes.
