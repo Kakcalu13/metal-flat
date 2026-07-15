@@ -8,10 +8,11 @@
  *
  * Buffer contract for every *_search: out_ids and out_distances are caller-
  * allocated and must each hold at least m * k elements, row-major (row r, col j
- * at r*k + j), nearest-first. *out_k_used (nullable) receives how many columns
- * per row were actually written (FlatIndex serves any k; the IVF/IVFPQ GPU
- * paths cap k at MFLAT_MAX_K and serve larger k on the exact-CPU path; the
- * graph index caps k at MFLAT_MAX_K). ids are -1 padded.
+ * at r*k + j), nearest-first. EVERY index serves any k >= 1; k up to MFLAT_MAX_K
+ * uses the GPU top-k, larger k transparently uses the CPU top-k path (same
+ * results). *out_k_used (nullable) receives how many columns per row were
+ * actually written (< k only when the database holds fewer than k vectors).
+ * ids are -1 padded.
  *
  * Apple Silicon only; without a Metal device the engine falls back to exact CPU.
  */
@@ -33,7 +34,12 @@ extern "C" {
 #define MFLAT_VERSION_MAJOR 0
 #define MFLAT_VERSION_MINOR 2
 #define MFLAT_VERSION_PATCH 0
-#define MFLAT_MAX_K 64          /* GPU per-thread top-k limit; mirrors kMaxK */
+/* The largest k the GPU top-k path serves directly (per-thread register
+ * width). NOT a cap on k: search() serves any k >= 1, routing k > MFLAT_MAX_K
+ * to the CPU top-k path with identical results. Also the graph-degree bound
+ * (R + 1 <= MFLAT_MAX_K). Named _MAX_K for history; read it as the GPU
+ * fast-path limit, not a ceiling. */
+#define MFLAT_MAX_K 64
 
 typedef enum {                  /* value-stable; mirrors mflat::Metric */
     MFLAT_METRIC_L2            = 0,
@@ -53,7 +59,8 @@ typedef enum {
 
 MFLAT_API const char* mflat_version(void);             /* "0.2.0"             */
 MFLAT_API const char* mflat_status_str(mflat_status_t);/* static; do not free */
-MFLAT_API int         mflat_max_k(void);               /* MFLAT_MAX_K         */
+MFLAT_API int         mflat_max_k(void);               /* GPU fast-path k limit;
+                                                          NOT a cap — see above */
 
 /* ---------------- Logging -------------------------------------------- */
 /* By default the library writes diagnostics to stderr ("[metalflat] ..."). */
@@ -124,6 +131,10 @@ MFLAT_API void mflat_ivfpq_set_rerank(mflat_ivfpq_index_t*, int enable);
    (slower build, higher recall at the same code size). */
 MFLAT_API void mflat_ivfpq_set_residual(mflat_ivfpq_index_t*, int enable);
 MFLAT_API void mflat_ivfpq_set_opq(mflat_ivfpq_index_t*, int enable);
+/* 4-bit fast-scan codes (v0.2+): same bytes/vector, SIMD-register LUTs on the
+   CPU shortlist path — the high-recall (rerank) regime. Needs dim % (2*m_sub)
+   == 0; silently falls back to 8-bit otherwise. Latched at build(). */
+MFLAT_API void mflat_ivfpq_set_fastscan(mflat_ivfpq_index_t*, int enable);
 
 MFLAT_API int mflat_ivfpq_ready(const mflat_ivfpq_index_t*);  /* 1 after build() */
 MFLAT_API int mflat_ivfpq_size (const mflat_ivfpq_index_t*);
@@ -159,7 +170,7 @@ MFLAT_API mflat_status_t mflat_graph_build(mflat_graph_index_t*, const float* ve
 /* Beam search. L = beam width, the recall/speed knob (<= 0 => 64; >= k).
    max_iter <= 0 => auto. num_start = restart seeds (<= 0 => 32).
    search_width = nodes expanded per iteration (<= 0 => 1, capped at 16).
-   k is capped at MFLAT_MAX_K (see *out_k_used). */
+   Any k >= 1 (k > MFLAT_MAX_K routes to the CPU beam; see the buffer contract). */
 MFLAT_API mflat_status_t mflat_graph_search(mflat_graph_index_t*, const float* queries,
         int m, int k, int L, int max_iter, int num_start, int search_width,
         int32_t* out_ids, float* out_distances, int* out_k_used);
