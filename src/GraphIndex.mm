@@ -189,26 +189,48 @@ kernel void graph_search(
         // unvisited beam node remains, skipping the wasted no-op iterations.
         if (haveParent == 0) break;
 
-        // Load beam into scratch [0,L); expand the W parents' neighbours into
-        // [L, L+W*R). Duplicates (across parents / with the beam) are dropped below.
+        // Load beam into scratch [0,L); gather the W parents' neighbour IDS into
+        // [L, L+W*R). Ids first, distances second: a neighbour already in the
+        // beam (or duplicated across parents) is dropped BEFORE we pay for its
+        // distance, which also removes the need to compact duplicates later.
         for (uint i = tid; i < Lc; i += tgs) {
             if (i < L) { mScore[i] = lScore[i]; mId[i] = lId[i]; }
             else       { mScore[i] = -INFINITY; mId[i] = -1;     }
         }
         for (uint e = tid; e < W * R; e += tgs) {
-            int par = parents[e / R];
-            int nid = -1; float sc = -INFINITY;
-            if (par >= 0) { nid = graph[(uint64_t)par * R + (e % R)];
-                            if (nid >= 0) sc = gdist(db, qsh, nid, dim, isL2); }
-            if (L + e < Lc) { mScore[L + e] = sc; mId[L + e] = nid; }
+            const int par = parents[e / R];
+            int nid = -1;
+            if (par >= 0) nid = graph[(uint64_t)par * R + (e % R)];
+            if (L + e < Lc) mId[L + e] = nid;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        gbitonic(mScore, mId, Lc, tid, tgs);
-        // Drop duplicate ids (equal id => equal score => adjacent after the sort).
-        for (uint i = tid; i < Lc; i += tgs)
-            if (i > 0u && mId[i] >= 0 && mId[i] == mId[i - 1]) mScore[i] = -INFINITY;
+        // DEDUP BY COMPARISON, not by sorting. The old kernel sorted Lc, marked
+        // adjacent equal ids, then sorted Lc AGAIN just to compact them — two
+        // cooperative bitonic sorts (36 barrier-separated stages each at Lc=256)
+        // per iteration, when the real work is W*R distance computations. A
+        // candidate is a duplicate iff its id already sits in the beam [0,L) or
+        // in an earlier candidate slot; that is a barrier-free O(L + e) scan, so
+        // ONE sort now suffices and the per-iteration barrier count halves.
+        for (uint e = tid; e < W * R; e += tgs) {
+            if (L + e >= Lc) continue;
+            const int nid = mId[L + e];
+            if (nid < 0) continue;
+            bool dup = false;
+            for (uint i = 0; i < L && !dup; ++i) if (mId[i] == nid) dup = true;
+            for (uint j = 0; j < e && !dup; ++j) if (mId[L + j] == nid) dup = true;
+            if (dup) mId[L + e] = -1;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Distances for the survivors only.
+        for (uint e = tid; e < W * R; e += tgs) {
+            if (L + e >= Lc) continue;
+            const int nid = mId[L + e];
+            mScore[L + e] = (nid >= 0) ? gdist(db, qsh, nid, dim, isL2) : -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         gbitonic(mScore, mId, Lc, tid, tgs);
 
         // Keep the top-L back in the beam.
@@ -921,7 +943,15 @@ static SearchResult searchCpu(const float* db, const __fp16* dbH,
             // the beam, and prefetch full rows only for the survivors — so the
             // expensive DRAM gathers are issued only where they can matter.
             if (useFilter && static_cast<int>(beam.size()) >= L) {
-                const float worstD2 = -beam[L - 1].s;   // beam holds -d^2
+                // The bound lives in SQUARED-L2 space, but the beam holds the
+                // metric's score: -d^2 for L2, but the DOT PRODUCT for Cosine.
+                // Cosine normalizes both db and query, so d^2 = 2 - 2*dot
+                // exactly — convert, don't assume. (Reading the beam as -d^2
+                // under Cosine made the filter reject almost every neighbour:
+                // recall 0.026. The metric paths need testing, not reasoning.)
+                const float worstS  = beam[L - 1].s;
+                const float worstD2 = (metric == Metric::L2) ? -worstS
+                                                             : 2.0f - 2.0f * worstS;
                 int w = 0;
                 for (const int id : fresh)
                     if (lowerBoundD2(id) <= worstD2) {
@@ -1054,19 +1084,27 @@ SearchResult GraphIndex::search(const float* queries, int m, int k, int L, int m
     //      O(log L) and prunes neighbours with the lossless filter (which the
     //      kernel does NOT have). Past L~64 the CPU wins at EVERY batch size.
     //
-    // Measured on SIFT1M (temp/gx.mm, gpu ms vs cpu ms, R=63, W=1):
-    //   L=32:  m=256  3.0 / 4.2  -> GPU     ; m=8192  75.8 / 137.3 -> GPU
-    //   L=64:  m=256  9.4 / 7.2  -> CPU     ; m=512   15.8 / 16.8  -> GPU
-    //   L=128: m=1000 88.9 / 57.6 -> CPU    ; m=8192 723.2 / 375.2 -> CPU
+    // W also matters, and not the way it does on the CPU. The kernel pays ONE
+    // cooperative sort of Lc per iteration no matter how few candidates it has,
+    // and at W=1 only W*R (=63) of its 256 threads compute distances — so W=1
+    // starves it twice over. Raising W fills the threads AND amortises the sort
+    // (iterations fall as 1/W). The CPU wants the opposite: W=1, because every
+    // extra parent is wasted work it cannot hide.
     //
-    // These cutoffs are a curve fit to THIS machine, which is a weakness (see
-    // the note in here.txt). The real fix is the kernel: give it the filter and
-    // stop re-sorting the beam every iteration, and the GPU should take L=128
-    // back. MFLAT_GRAPH_CPU=1/0 forces the CPU/GPU path.
-    const int gpuMinBatch = (L <= 32) ? 256
-                          : (L <= 64) ? 512
-                          : INT_MAX;          // L > 64: the CPU wins outright
-    bool cpuRoute = (m < gpuMinBatch);
+    // Measured on SIFT1M, m=1000, R=63 (temp/gx.mm, gpu ms / cpu ms):
+    //   L=96   W=1  46.8 / 38.2 CPU    W=2  27.6 / 39.8 GPU    W=8  58.8 / 53.5 CPU
+    //   L=128  W=1  65.4 / 47.6 CPU    W=2  42.1 / 51.9 GPU    W=8  76.0 / 64.3 CPU
+    //   L=192  W=1 208.5 / 69.6 CPU    W=4  83.8 / 69.7 CPU
+    // and at W=1 across batch: L=32 GPU from m>=256, L=64 GPU from m>=512.
+    //
+    // These cutoffs remain a curve fit to THIS machine (see here.txt). What
+    // removed the L=128 loss was the KERNEL, not the table: it used to sort Lc
+    // TWICE per iteration (once to order, once to compact duplicates); dedup is
+    // now a barrier-free comparison and one sort suffices.
+    // MFLAT_GRAPH_CPU=1/0 forces the CPU/GPU path.
+    const bool gpuSuitsL = (L <= 64) || (L <= 128 && W >= 2 && W <= 4);
+    const int  gpuMinBatch = (L <= 32) ? 256 : 512;
+    bool cpuRoute = !gpuSuitsL || (m < gpuMinBatch);
     if (const char* e = std::getenv("MFLAT_GRAPH_CPU")) cpuRoute = (e[0] != '0');
     const NSUInteger maxT = mImpl->pipe ? mImpl->pipe.maxTotalThreadsPerThreadgroup : 0;
     const bool gpu = !cpuRoute && mImpl->pipe && mImpl->dbBuf && k <= kMaxK
@@ -1106,7 +1144,11 @@ SearchResult GraphIndex::search(const float* queries, int m, int k, int L, int m
         p.metric = (uint32_t)metric; p.queryCount = (uint32_t)m;
         p.dbCount = (uint32_t)n; p.entry = (uint32_t)entry; p.H = H; p.W = (uint32_t)W;
 
-        id<MTLCommandBuffer>         cb  = [mImpl->queue commandBuffer];
+        // commandBufferWithUnretainedReferences: skip per-resource retain/release —
+        // measurable at m=1 where the fixed dispatch cost IS the latency. Safe
+        // because every bound buffer is index-owned or persistent scratch
+        // (GpuScratch.h) and search() awaits completion before returning.
+        id<MTLCommandBuffer>         cb  = [mImpl->queue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:mImpl->pipe];
         [enc setBuffer:mImpl->dbBuf    offset:0 atIndex:0];
