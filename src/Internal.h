@@ -216,7 +216,23 @@ inline id<MTLComputePipelineState> kmeansAssignPipeline(id<MTLDevice> dev, uint3
 // `assignOut` stays consistent with the returned centroids.
 inline void kmeansGpu(const float* data, int n, int dim, int nlist, int iters,
                       std::vector<float>& centroids, std::vector<int>& assignOut,
-                      int maxPointsPerCentroid = 0) {
+                      int maxPointsPerCentroid = 0, bool spherical = false) {
+    // Spherical k-means: renormalize centroids after every update, so the
+    // final centroids are unit vectors like the (Cosine-normalized) data.
+    // On unit centroids argmin-L2 == argmax-dot, which is what makes the
+    // partition match the angular neighbourhood structure (faiss trains its
+    // angular IVF the same way; measured on glove it is pure coverage win).
+    auto sphericalize = [&] {
+        if (!spherical) return;
+        for (int c = 0; c < nlist; ++c) {
+            float* ce = &centroids[static_cast<size_t>(c) * dim];
+            float nrm = 0.0f;
+            for (int d = 0; d < dim; ++d) nrm += ce[d] * ce[d];
+            if (nrm <= 0.0f) continue;
+            const float inv = 1.0f / std::sqrt(nrm);
+            for (int d = 0; d < dim; ++d) ce[d] *= inv;
+        }
+    };
     centroids.assign(static_cast<size_t>(nlist) * dim, 0.0f);
     std::mt19937 rng(12345);
     std::vector<int> perm(n);
@@ -336,6 +352,7 @@ inline void kmeansGpu(const float* data, int n, int dim, int nlist, int iters,
                     std::memcpy(a.data(), [assignBuf contents],
                                 static_cast<size_t>(trainN) * sizeof(int32_t));
                     accumulateCentroids(trainPtr, trainN, dim, nlist, a, centroids, rng);
+                    sphericalize();
                 }
                 assignPass(fullBuf, n);   // final assignment, all points
                 std::memcpy(assignOut.data(), [assignBuf contents],
@@ -360,6 +377,7 @@ inline void kmeansGpu(const float* data, int n, int dim, int nlist, int iters,
     for (int it = 0; it < iters; ++it) {
         assignNow(trainPtr, trainN, a);
         accumulateCentroids(trainPtr, trainN, dim, nlist, a, centroids, rng);
+        sphericalize();
     }
     assignNow(data, n, assignOut);  // final assignment consistent with centroids
 }
