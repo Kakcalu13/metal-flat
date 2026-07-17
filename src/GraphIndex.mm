@@ -375,6 +375,50 @@ int  GraphIndex::dim()    const { return mImpl->dim; }
 int  GraphIndex::size()   const { return mImpl->dbCount; }
 int  GraphIndex::degree() const { return mImpl->R; }
 
+struct VisitedSet {
+    std::vector<int32_t> slots;
+    uint32_t mask  = 0;
+    uint32_t count = 0;
+    explicit VisitedSet(uint32_t cap) {
+        uint32_t h = 64; while (h < cap) h <<= 1;
+        slots.assign(h, 0); mask = h - 1;
+    }
+    bool insert(int id) {   // true if newly inserted
+        if ((count + 1) * 2 > slots.size()) grow();
+        uint32_t h = mix(static_cast<uint32_t>(id)) & mask;
+        for (;;) {
+            const int32_t s = slots[h];
+            if (s == 0)      { slots[h] = id + 1; ++count; return true; }
+            if (s == id + 1) return false;
+            h = (h + 1) & mask;
+        }
+    }
+    void grow() {
+        std::vector<int32_t> old;
+        old.swap(slots);
+        slots.assign(old.size() * 2, 0);
+        mask = static_cast<uint32_t>(slots.size()) - 1;
+        for (const int32_t s : old)
+            if (s) {
+                uint32_t h = mix(static_cast<uint32_t>(s - 1)) & mask;
+                while (slots[h]) h = (h + 1) & mask;
+                slots[h] = s;
+            }
+    }
+};
+
+static SearchResult searchCpu(const float* db, const __fp16* dbH,
+                              const int32_t* graph, int dim, int R,
+                              int n, int entry, Metric metric,
+                              const float* queries, int m, int k, int L, int numStart,
+                              int W, int pqM, int ksub,
+                              const uint8_t* codes, const float* err,
+                              const float* cenT, const float* pqNorm,
+                              const int32_t* selfSeed = nullptr);
+static inline float score4(Metric metric, const float* a, const float* b, int dim);
+static inline float score4H(Metric metric, const float* a, const __fp16* b, int dim);
+extern std::atomic<long> gSeen, gKept;   // filter skip-rate counters (defined below)
+
 void GraphIndex::build(const float* vectors, int n, int nprobe) {
     if (n <= 0 || mImpl->dim <= 0) return;
     const int dim = mImpl->dim, R = mImpl->R;
@@ -406,14 +450,20 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     // subset GT). The pruner needs the deep candidate list even though it keeps
     // few. Cut build cost via the coarse partition instead (see autoNlist).
     // MFLAT_GRAPH_K0 overrides.
+    // The GPU self-search caps k at kMaxK, but a CACHED candidate file (or a
+    // CPU-searched refinement round) may go deeper — hnswlib's efConstruction
+    // ~500 selects edges from a far deeper pool than 64, which is where its
+    // glove ceiling comes from. kMaxCand bounds the prune scratch.
+    constexpr int kMaxCand = 512;
     int K0 = kMaxK;
     if (const char* e = std::getenv("MFLAT_GRAPH_K0")) K0 = atoi(e);
-    K0 = std::max(8, std::min(K0, kMaxK));
+    K0 = std::max(8, std::min(K0, kMaxCand));
     std::vector<int32_t> knn;
     const char* kc = std::getenv("MFLAT_KNN_CACHE");
     if (!(kc && loadKnn(kc, knn, n, K0))) {
         IvfIndex ivf(dim, metric, autoNlist(n));
-        ivf.build(data, n);
+        ivf.build(data, n, /*kmeansIters=*/12);   // bootstrap only — the refine
+                                                  // round rebuilds the lists
         const double bms = lap();
         knn = ivf.search(data, n, K0, nprobe).ids;    // N × K0, sorted by distance
         MFLAT_LOG_INFO("graph build: ivf train %.0f ms, knn self-search %.0f ms "
@@ -427,25 +477,53 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     // closer to b than a is (score(c,b) > score(a,b)). This removes "detourable"
     // edges and yields a graph a greedy bounded-beam can actually descend — the
     // property a raw kNN graph lacks. Forward edges fill columns [0,fwdCount).
-    mImpl->graph.assign(static_cast<size_t>(n) * R, -1);
+    // On hard datasets (glove: high intrinsic dim) pruning keeps very few edges
+    // (mean ~17 of 63), which caps reachability and thus the recall ceiling.
+    // CAGRA fills the forward list back up with skipped candidates — MEASURED
+    // on glove: fill only trades away reverse-edge slots (which carry the
+    // recall) and never helps; with deep refinement pools it actively hurts
+    // (fill=31: 0.9627 vs 0.9897 @L=512, 200k). Default OFF; MFLAT_GRAPH_FILL
+    // re-enables for experiments.
+    int fillTo = 0;
+    if (const char* e = std::getenv("MFLAT_GRAPH_FILL")) fillTo = atoi(e);
+    fillTo = std::max(0, std::min(fillTo, R));
+    // DiskANN-style relaxed occlusion: prune b only if a kept neighbour c is
+    // MUCH closer to b (alpha^2 * d2(c,b) < d2(a,b), alpha > 1). MEASURED on
+    // glove: every alpha > 1 LOSES (1.2: 0.9389 vs 0.9535 @L=512) — like fill,
+    // the extra forward edges only evict reverse edges. Deep refinement pools
+    // (step 4) widen the forward set the useful way instead. Strict by
+    // default; MFLAT_GRAPH_ALPHA overrides for experiments.
+    float alpha = 1.0f;
+    if (const char* e = std::getenv("MFLAT_GRAPH_ALPHA")) alpha = (float)atof(e);
+    const float alpha2 = alpha * alpha;
     std::vector<int32_t> fwdCount(n, 0);
+    // Steps 2+3 as a unit so the refinement rounds (step 4) can rebuild the
+    // adjacency from improved kNN lists.
+    auto buildAdjacency = [&](const std::vector<int32_t>& knnList, int Kc) {
+    mImpl->graph.assign(static_cast<size_t>(n) * R, -1);
     parallelFor(n, [&](int a) {
-        const int32_t* cand = &knn[static_cast<size_t>(a) * K0];
+        const int32_t* cand = &knnList[static_cast<size_t>(a) * Kc];
         const float*   va   = data + static_cast<size_t>(a) * dim;
         int32_t* row = &mImpl->graph[static_cast<size_t>(a) * R];
-        int w = 0;
-        for (int j = 0; j < K0 && w < R; ++j) {
+        int32_t skipped[kMaxCand];
+        int w = 0, s = 0;
+        for (int j = 0; j < Kc && w < R; ++j) {
             const int b = cand[j];
             if (b == a || b < 0) continue;             // drop self / pads
             const float* vb = data + static_cast<size_t>(b) * dim;
-            const float sab = score(metric, va, vb, dim);
+            const float sab  = score4(metric, va, vb, dim);
+            const float d2ab = (metric == Metric::L2) ? -sab : 2.0f - 2.0f * sab;
             bool occluded = false;
             for (int e = 0; e < w; ++e) {              // already-kept neighbours
-                const float* vc = data + static_cast<size_t>(row[e]) * dim;
-                if (score(metric, vc, vb, dim) > sab) { occluded = true; break; }
+                const float* vc  = data + static_cast<size_t>(row[e]) * dim;
+                const float scb  = score4(metric, vc, vb, dim);
+                const float d2cb = (metric == Metric::L2) ? -scb : 2.0f - 2.0f * scb;
+                if (alpha2 * d2cb < d2ab) { occluded = true; break; }
             }
             if (!occluded) row[w++] = b;
+            else           skipped[s++] = b;
         }
+        for (int j = 0; j < s && w < fillTo; ++j) row[w++] = skipped[j];
         fwdCount[a] = w;
     });
 
@@ -461,23 +539,55 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     // If a -> b survived pruning, register b -> a in b's free columns
     // [fwdCount[b], R). RNG pruning leaves most nodes below R, so there is room;
     // reverse links let the search reach nodes no forward edge points at.
+    // Selection matters on hub-heavy data (glove): a hub receives more reverse
+    // candidates than it has room, and first-come order keeps arbitrary ones.
+    // Collect all arrivals per node (CSR), then keep the CLOSEST by true score.
     const bool addReverse = !(std::getenv("MFLAT_GRAPH_NOREV"));
-    std::vector<std::atomic<int>> revCursor(n);
-    for (int v = 0; v < n; ++v) revCursor[v].store(0, std::memory_order_relaxed);
-    if (addReverse)
-    parallelFor(n, [&](int a) {
-        const int32_t* row = &mImpl->graph[static_cast<size_t>(a) * R];
-        for (int e = 0; e < fwdCount[a]; ++e) {
-            const int b = row[e];
+    if (addReverse) {
+        std::vector<std::atomic<int>> arrivals(n);
+        for (int v = 0; v < n; ++v) arrivals[v].store(0, std::memory_order_relaxed);
+        parallelFor(n, [&](int a) {
+            const int32_t* row = &mImpl->graph[static_cast<size_t>(a) * R];
+            for (int e = 0; e < fwdCount[a]; ++e)
+                arrivals[row[e]].fetch_add(1, std::memory_order_relaxed);
+        });
+        std::vector<int64_t> off(n + 1, 0);
+        for (int v = 0; v < n; ++v) off[v + 1] = off[v] + arrivals[v].load(std::memory_order_relaxed);
+        std::vector<int32_t> pool(off[n]);
+        for (int v = 0; v < n; ++v) arrivals[v].store(0, std::memory_order_relaxed);
+        parallelFor(n, [&](int a) {
+            const int32_t* row = &mImpl->graph[static_cast<size_t>(a) * R];
+            for (int e = 0; e < fwdCount[a]; ++e) {
+                const int b   = row[e];
+                const int pos = arrivals[b].fetch_add(1, std::memory_order_relaxed);
+                pool[off[b] + pos] = a;
+            }
+        });
+        parallelFor(n, [&](int b) {
             const int room = R - fwdCount[b];
-            if (room <= 0) continue;
-            const int pos = revCursor[b].fetch_add(1, std::memory_order_relaxed);
-            if (pos < room)
-                mImpl->graph[static_cast<size_t>(b) * R + fwdCount[b] + pos] = a;
-        }
-    });
+            const int cnt  = arrivals[b].load(std::memory_order_relaxed);
+            if (room <= 0 || cnt == 0) return;
+            int32_t* row = &mImpl->graph[static_cast<size_t>(b) * R];
+            const float* vb = data + static_cast<size_t>(b) * dim;
+            const int32_t* cand = &pool[off[b]];
+            if (cnt <= room) {                          // all fit — no scoring needed
+                for (int j = 0; j < cnt; ++j) row[fwdCount[b] + j] = cand[j];
+                return;
+            }
+            std::vector<std::pair<float, int32_t>> sc(cnt);
+            for (int j = 0; j < cnt; ++j) {
+                const float* va = data + static_cast<size_t>(cand[j]) * dim;
+                sc[j] = { score4(metric, vb, va, dim), cand[j] };
+            }
+            std::partial_sort(sc.begin(), sc.begin() + room, sc.end(),
+                              [](const auto& x, const auto& y) { return x.first > y.first; });
+            for (int j = 0; j < room; ++j) row[fwdCount[b] + j] = sc[j].second;
+        });
+    }
     // Duplicate edges (a mutual neighbour landing in both halves) are harmless —
     // the traversal's visited set / the GPU dedup collapse them.
+    };
+    buildAdjacency(knn, K0);
 
     // --- entry medoid (nearest db vector to the global mean) ----------------
     std::vector<float> mean(dim, 0.0f);
@@ -500,9 +610,116 @@ void GraphIndex::build(const float* vectors, int n, int nprobe) {
     uploadGpu(mImpl.get());
     const double ums = lap();
 
+    // --- 4. refinement round: DEEP candidate pools (the hnswlib gap) ---------
+    // The v1 graph is seeded from K0<=64 kNN lists (GPU top-k width). MEASURED
+    // on glove-200k with EXACT lists, that pool depth — not list accuracy, not
+    // degree, not the prune rule — is what caps recall: exact 64-deep pools
+    // give 0.986 @L=512 while 256-deep pools give 0.9919 (forward degree rises
+    // 19 -> 39 with longer-range edges; hnswlib gets the same effect from
+    // efConstruction ~500). So the refinement re-searches the v1 graph on the
+    // CPU beam (any k, L > 128 routes there) for a kRef-deep pool and rebuilds
+    // the adjacency from it. MFLAT_GRAPH_REFINE = rounds, MFLAT_GRAPH_KREF =
+    // pool depth.
+    // Filter first: the refinement's deep self-search is exactly the kind of
+    // traversal the lossless filter accelerates, and the filter depends only on
+    // the db vectors, not the adjacency — safe to build before rewiring edges.
     buildFilter(mImpl.get(), data, n);
     MFLAT_LOG_INFO("graph build: reverse+medoid %.0f ms, gpu upload %.0f ms, "
                    "filter codes %.0f ms", rms, ums, lap());
+
+    // The filter pays only when its lower bound actually skips row reads —
+    // tight PQ bounds (SIFT: most candidates skipped). On high-intrinsic-dim
+    // data (glove) the bounds are loose, the skip rate is ~0, and the filter
+    // is pure LUT-build + bound-eval overhead on EVERY query (measured ~18%
+    // of CPU search time, and same recall without it — it is lossless, so
+    // dropping it never changes results, only cost). Probe the skip rate on a
+    // small self-query sample and drop the filter when it does not pay.
+    if (!mImpl->pqCodes.empty() && n > 1000) {
+        // Race a query sample with the filter on vs off and keep the faster
+        // configuration — skip RATE is not the right signal (skipped gathers
+        // are nearly free while the db fits in cache, and priceless once it
+        // spills to DRAM); wall time is. The filter is lossless, so this can
+        // never change results, only speed.
+        const int sample = 512;
+        std::vector<float> sq(static_cast<size_t>(sample) * dim);
+        const int stride = n / sample;
+        for (int i = 0; i < sample; ++i)
+            std::copy_n(data + static_cast<size_t>(i) * stride * dim, dim,
+                        &sq[static_cast<size_t>(i) * dim]);
+        auto race = [&](bool filt) {
+            const auto t0 = Clock::now();
+            searchCpu(mImpl->db.data(), mImpl->dbHalfCpu(), mImpl->graph.data(),
+                      dim, R, n, mImpl->entry, metric, sq.data(), sample,
+                      /*k=*/10, /*L=*/128, /*numStart=*/32, /*W=*/1,
+                      filt ? mImpl->pqM : 0, mImpl->pq ? mImpl->pq->ksub() : 256,
+                      filt ? mImpl->pqCodes.data() : nullptr,
+                      filt ? mImpl->pqErr.data()   : nullptr,
+                      filt ? mImpl->pqCenT.data()  : nullptr,
+                      filt ? mImpl->pqNorm.data()  : nullptr);
+            return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        };
+        race(true);                        // warm caches off the clock
+        const double tOn  = race(true);
+        const double tOff = race(false);
+        // Require a clear margin: near break-even (SIFT measures within ~2%
+        // either way run-to-run) keep the filter — a noise-flip must not make
+        // build output nondeterministic, and the filter's wins concentrate at
+        // beams the single race point underweights.
+        if (tOff < 0.93 * tOn) {
+            mImpl->pqM = 0;
+            mImpl->pqCodes.clear(); mImpl->pqCodes.shrink_to_fit();
+            mImpl->pqErr.clear();   mImpl->pqErr.shrink_to_fit();
+            mImpl->pqCenT.clear();  mImpl->pqCenT.shrink_to_fit();
+            mImpl->pqNorm.clear();  mImpl->pqNorm.shrink_to_fit();
+            mImpl->pq.reset();
+        }
+        MFLAT_LOG_INFO("graph build: filter race on=%.0f ms off=%.0f ms -> %s",
+                       tOn, tOff, tOff < tOn ? "DROPPED (does not pay)" : "kept");
+        gSeen.store(0); gKept.store(0);
+    }
+
+    int refine = 1;
+    if (const char* e = std::getenv("MFLAT_GRAPH_REFINE")) refine = atoi(e);
+    int kRef = std::min(4 * K0, kMaxCand);
+    if (const char* e = std::getenv("MFLAT_GRAPH_KREF")) kRef = atoi(e);
+    kRef = std::max(K0, std::min(kRef, kMaxCand));
+    int refineNumStart = 1;   // self-seeded: random restarts add ~nothing
+    if (const char* e = std::getenv("MFLAT_GRAPH_REFINE_NS")) refineNumStart = atoi(e);
+    int refineW = 1;
+    if (const char* e = std::getenv("MFLAT_GRAPH_REFINE_W")) refineW = atoi(e);
+    for (int round = 0; round < refine; ++round) {
+        std::vector<int32_t> knn2(static_cast<size_t>(n) * kRef, -1);
+        // CPU deep beam (k and L exceed the GPU kernel's limits), seeded at
+        // each query's own db row — the perfect entry, no descent needed.
+        // Cheaper pool constructions were MEASURED and lost: a 2-hop local
+        // join (0.9827 vs 0.9898 @L=512, glove-200k), joins over GPU-refreshed
+        // lists (0.9881), iterated joins (converge at 0.9844) — multi-hop
+        // beam reach is what the deep pool actually needs.
+        const int chunk = 131072;
+        std::vector<int32_t> selfIds(chunk);
+        for (int s0 = 0; s0 < n; s0 += chunk) {
+            const int mQ = std::min(chunk, n - s0);
+            for (int i = 0; i < mQ; ++i) selfIds[i] = s0 + i;
+            SearchResult sr = searchCpu(
+                mImpl->db.data(), mImpl->dbHalfCpu(), mImpl->graph.data(),
+                dim, R, n, mImpl->entry, metric,
+                data + static_cast<size_t>(s0) * dim, mQ, kRef, /*L=*/kRef,
+                /*numStart=*/refineNumStart, /*W=*/refineW,
+                mImpl->pqM, mImpl->pq ? mImpl->pq->ksub() : 256,
+                mImpl->pqCodes.empty() ? nullptr : mImpl->pqCodes.data(),
+                mImpl->pqErr.empty()   ? nullptr : mImpl->pqErr.data(),
+                mImpl->pqCenT.empty()  ? nullptr : mImpl->pqCenT.data(),
+                mImpl->pqNorm.empty()  ? nullptr : mImpl->pqNorm.data(),
+                selfIds.data());
+            std::copy(sr.ids.begin(), sr.ids.end(),
+                      knn2.begin() + static_cast<size_t>(s0) * kRef);
+        }
+        const double sms = lap();
+        buildAdjacency(knn2, kRef);
+        uploadGpu(mImpl.get());
+        MFLAT_LOG_INFO("graph build: refine round %d — deep self-search %.0f ms "
+                       "(kRef=%d), re-prune+upload %.0f ms", round + 1, sms, kRef, lap());
+    }
 }
 
 // Train the traversal filter: PQ codes + each vector's quantization error.
@@ -676,7 +893,7 @@ bool GraphIndex::load(const char* path) {
 // Filter effectiveness counters (MFLAT_GRAPH_FILTERSTATS=1 prints the keep rate
 // at process exit) — a filter that rejects little is pure overhead, so this is
 // the number that decides whether the whole idea pays.
-std::atomic<long> gSeen{0}, gKept{0};
+std::atomic<long> gSeen{0}, gKept{0};   // declared above build()
 struct FilterStats {
     ~FilterStats() {
         if (!std::getenv("MFLAT_GRAPH_FILTERSTATS")) return;
@@ -689,38 +906,6 @@ struct FilterStats {
 // Open-addressing visited set (id+1 stored, 0 = empty; linear probing, grows at
 // 50% load) — the CPU twin of the kernel's vhash. std::unordered_set was ~half
 // the single-query latency budget (hash + node allocations per insert).
-struct VisitedSet {
-    std::vector<int32_t> slots;
-    uint32_t mask  = 0;
-    uint32_t count = 0;
-    explicit VisitedSet(uint32_t cap) {
-        uint32_t h = 64; while (h < cap) h <<= 1;
-        slots.assign(h, 0); mask = h - 1;
-    }
-    bool insert(int id) {   // true if newly inserted
-        if ((count + 1) * 2 > slots.size()) grow();
-        uint32_t h = mix(static_cast<uint32_t>(id)) & mask;
-        for (;;) {
-            const int32_t s = slots[h];
-            if (s == 0)      { slots[h] = id + 1; ++count; return true; }
-            if (s == id + 1) return false;
-            h = (h + 1) & mask;
-        }
-    }
-    void grow() {
-        std::vector<int32_t> old;
-        old.swap(slots);
-        slots.assign(old.size() * 2, 0);
-        mask = static_cast<uint32_t>(slots.size()) - 1;
-        for (const int32_t s : old)
-            if (s) {
-                uint32_t h = mix(static_cast<uint32_t>(s - 1)) & mask;
-                while (slots[h]) h = (h + 1) & mask;
-                slots[h] = s;
-            }
-    }
-};
-
 // 4-accumulator metric score, local to the graph traversal hot path. The
 // Distance.h primitives accumulate serially by contract (bit-stable reference);
 // here the serial float dependency chain IS the bottleneck (one FMA latency per
@@ -793,7 +978,8 @@ static SearchResult searchCpu(const float* db, const __fp16* dbH,
                               const float* queries, int m, int k, int L, int numStart,
                               int W, int pqM, int ksub,
                               const uint8_t* codes, const float* err,
-                              const float* cenT, const float* pqNorm) {
+                              const float* cenT, const float* pqNorm,
+                              const int32_t* selfSeed) {
     SearchResult out;
     out.ids.assign(static_cast<size_t>(m) * k, -1);
     out.distances.assign(static_cast<size_t>(m) * k, emptyValue(metric));
@@ -891,6 +1077,10 @@ static SearchResult searchCpu(const float* db, const __fp16* dbH,
         };
 
         if (visited.insert(entry)) push(scoreExact(q, entry), entry);
+        // Self-search (build refinement): the query IS db row selfSeed[qi], so
+        // seed the beam with it — the best possible entry, no descent needed.
+        if (selfSeed && visited.insert(selfSeed[qi]))
+            push(scoreExact(q, selfSeed[qi]), selfSeed[qi]);
         for (int s = 1; s < numStart; ++s) {
             const int id = static_cast<int>(mix(static_cast<uint32_t>(qi) * 2654435761u + s) % n);
             if (visited.insert(id)) push(scoreExact(q, id), id);
