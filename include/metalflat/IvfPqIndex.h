@@ -81,8 +81,10 @@ public:
     // (NEON vqtbl1q_u8) instead of one scalar table load per code byte. This
     // targets the high-recall rerank configs, whose shortlists run on the CPU.
     // Shortlist ordering uses quantized (u8-LUT) distances; the exact rerank
-    // repairs the rounding. Requires dim % (2*m) == 0 (else falls back to
-    // 8-bit with a warning); the fast-scan shortlist path is CPU-only.
+    // repairs the rounding. Any dim: when dim % (2*m) != 0, vectors and queries
+    // are zero-padded to the next multiple — the padding contributes exactly 0
+    // to every distance. Requires 2*m <= 128 (u16 accumulator; else falls back
+    // to 8-bit with a warning); the fast-scan shortlist path is CPU-only.
     // Latched at build(): calling after build() only affects the NEXT build().
     void setFastScan(bool enable);
 

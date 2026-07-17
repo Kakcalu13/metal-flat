@@ -132,8 +132,10 @@ MFLAT_API void mflat_ivfpq_set_rerank(mflat_ivfpq_index_t*, int enable);
 MFLAT_API void mflat_ivfpq_set_residual(mflat_ivfpq_index_t*, int enable);
 MFLAT_API void mflat_ivfpq_set_opq(mflat_ivfpq_index_t*, int enable);
 /* 4-bit fast-scan codes (v0.2+): same bytes/vector, SIMD-register LUTs on the
-   CPU shortlist path — the high-recall (rerank) regime. Needs dim % (2*m_sub)
-   == 0; silently falls back to 8-bit otherwise. Latched at build(). */
+   CPU shortlist path — the high-recall (rerank) regime. Any dim (zero-padded
+   internally to a multiple of 2*m_sub; padding adds exactly 0 to distances).
+   Needs 2*m_sub <= 128; falls back to 8-bit with a warning otherwise.
+   Latched at build(). */
 MFLAT_API void mflat_ivfpq_set_fastscan(mflat_ivfpq_index_t*, int enable);
 
 MFLAT_API int mflat_ivfpq_ready(const mflat_ivfpq_index_t*);  /* 1 after build() */
@@ -163,8 +165,11 @@ MFLAT_API int mflat_graph_size  (const mflat_graph_index_t*);
 MFLAT_API int mflat_graph_dim   (const mflat_graph_index_t*);
 MFLAT_API int mflat_graph_degree(const mflat_graph_index_t*); /* R */
 
-/* nprobe = build-quality knob for the internal IVF self-search (<= 0 => 64:
-   higher = better graph, slower build). */
+/* nprobe = quality knob for the bootstrap IVF self-search (<= 0 => 64). The
+   build then runs a deep refinement round that re-derives every node's
+   candidate list from the graph itself, so final recall is nearly flat in
+   nprobe — 32 measures within noise of 64 at roughly half the bootstrap
+   cost; sub-16 starts to cost recall. */
 MFLAT_API mflat_status_t mflat_graph_build(mflat_graph_index_t*, const float* vectors,
         int n, int nprobe);
 /* Beam search. L = beam width, the recall/speed knob (<= 0 => 64; >= k).
