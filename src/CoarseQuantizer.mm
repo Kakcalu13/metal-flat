@@ -77,6 +77,7 @@ struct CoarseQuantizer::Impl {
     int                       dbCount = 0;
     bool                      gpuReady = false;
     std::vector<float>        centroids;
+    std::vector<float>        encodeCent;   // per-cell means (spherical only)
     std::vector<int>          cellStart;
     std::vector<int>          reorderedIds;
     std::unique_ptr<FlatIndex> coarse;
@@ -95,6 +96,9 @@ int CoarseQuantizer::dim()   const { return mImpl->dim; }
 int CoarseQuantizer::nlist() const { return mImpl->nlist; }
 int CoarseQuantizer::size()  const { return mImpl->dbCount; }
 const std::vector<float>& CoarseQuantizer::centroids()    const { return mImpl->centroids; }
+const std::vector<float>& CoarseQuantizer::encodeCentroids() const {
+    return mImpl->encodeCent.empty() ? mImpl->centroids : mImpl->encodeCent;
+}
 const std::vector<int>&   CoarseQuantizer::cellStart()    const { return mImpl->cellStart; }
 const std::vector<int>&   CoarseQuantizer::reorderedIds() const { return mImpl->reorderedIds; }
 bool          CoarseQuantizer::gpuReady()   const { return mImpl->gpuReady; }
@@ -102,7 +106,7 @@ id<MTLBuffer> CoarseQuantizer::cellBuffer() const { return mImpl->cellBuf; }
 id<MTLBuffer> CoarseQuantizer::idBuffer()   const { return mImpl->idBuf; }
 
 void CoarseQuantizer::train(const float* data, int n, int nlistReq, int iters,
-                            KmeansBackend backend) {
+                            KmeansBackend backend, bool spherical) {
     const int dim   = mImpl->dim;
     const int nlist = std::min(nlistReq, n);
     mImpl->nlist   = nlist;
@@ -114,10 +118,20 @@ void CoarseQuantizer::train(const float* data, int n, int nlistReq, int iters,
         // Training subsamples to 256 points/centroid (faiss convention) — the
         // final all-points assignment pass is unaffected.
         kmeansGpu(data, n, dim, nlist, iters, mImpl->centroids, assign,
-                  /*maxPointsPerCentroid=*/256);
+                  /*maxPointsPerCentroid=*/256, spherical);
     } else {
         // No device: scalar CPU k-means + one assignment pass.
         kmeans(data, n, dim, nlist, iters, mImpl->centroids);
+        if (spherical) {
+            for (int c = 0; c < nlist; ++c) {
+                float* ce = &mImpl->centroids[static_cast<size_t>(c) * dim];
+                float nrm = 0.0f;
+                for (int d = 0; d < dim; ++d) nrm += ce[d] * ce[d];
+                if (nrm <= 0.0f) continue;
+                const float inv = 1.0f / std::sqrt(nrm);
+                for (int d = 0; d < dim; ++d) ce[d] *= inv;
+            }
+        }
         assign.assign(n, 0);
         parallelFor(n, [&](int i) {
             const float* v = data + static_cast<size_t>(i) * dim;
@@ -140,6 +154,26 @@ void CoarseQuantizer::train(const float* data, int n, int nlistReq, int iters,
     for (int i = 0; i < n; ++i) {
         const int c = assign[i];
         mImpl->reorderedIds[cursor[c]++] = i;
+    }
+
+    // Spherical: exact per-cell means over ALL points (the CSR makes each cell
+    // a contiguous id slice), as the residual-encoding reference. Empty cells
+    // keep their unit centroid.
+    mImpl->encodeCent.clear();
+    if (spherical) {
+        mImpl->encodeCent = mImpl->centroids;
+        parallelFor(nlist, [&](int c) {
+            const int lo = mImpl->cellStart[c], hi = mImpl->cellStart[c + 1];
+            if (lo >= hi) return;
+            std::vector<double> acc(dim, 0.0);
+            for (int j = lo; j < hi; ++j) {
+                const float* v = data + static_cast<size_t>(mImpl->reorderedIds[j]) * dim;
+                for (int d = 0; d < dim; ++d) acc[d] += v[d];
+            }
+            float* out = &mImpl->encodeCent[static_cast<size_t>(c) * dim];
+            for (int d = 0; d < dim; ++d)
+                out[d] = static_cast<float>(acc[d] / (hi - lo));
+        });
     }
 
     // GPU coarse quantizer + CSR buffers (only if a device was provided).

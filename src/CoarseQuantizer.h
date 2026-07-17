@@ -41,13 +41,24 @@ public:
     // Train (seed 12345), assign, build CSR (cellStart + reorderedIds), and — if
     // a device was given — the coarse FlatIndex(dim,L2) + cell/id GPU buffers.
     // `data` is row-major n×dim, already metric-normalized. nlistReq clamped to n.
+    // spherical: renormalize centroids each k-means iteration (Cosine data —
+    // unit centroids make L2 assignment match the angular structure).
     void train(const float* data, int n, int nlistReq, int iters = 12,
-               KmeansBackend backend = KmeansBackend::Auto);
+               KmeansBackend backend = KmeansBackend::Auto,
+               bool spherical = false);
 
     int dim()  const;
     int nlist() const;
     int size() const;                                   // n (dbCount)
     const std::vector<float>& centroids()    const;     // nlist × dim
+    // Residual-encoding reference points. Identical to centroids() for plain
+    // k-means. Spherical training projects centroids to the unit sphere — right
+    // for assignment/probing, but it inflates ||x - c|| and with it the PQ
+    // quantization error. So spherical training also stores each cell's exact
+    // MEAN (over all assigned points) and residual encoders use that instead:
+    // the ADC math is exact for any per-cell reference; the mean minimizes the
+    // residual energy the PQ has to spend bits on.
+    const std::vector<float>& encodeCentroids() const;
     const std::vector<int>&   cellStart()    const;     // nlist + 1 (CSR offsets)
     const std::vector<int>&   reorderedIds() const;     // n: slot -> original id
 
