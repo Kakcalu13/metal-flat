@@ -439,7 +439,7 @@ int  IvfIndex::size()  const { return mImpl->dbCount; }
 int  IvfIndex::nlist() const { return mImpl->nlist; }
 bool IvfIndex::ready() const { return mImpl->ready; }
 
-void IvfIndex::build(const float* vectors, int n) {
+void IvfIndex::build(const float* vectors, int n, int kmeansIters) {
     if (n <= 0 || mImpl->dim <= 0) return;
     const int dim = mImpl->dim;
 
@@ -447,8 +447,14 @@ void IvfIndex::build(const float* vectors, int n) {
     if (mImpl->metric == Metric::Cosine) normalizeRows(data, n, dim);
 
     // Coarse quantizer: k-means + CSR + coarse FlatIndex + cell/id GPU buffers.
-    mImpl->cq->train(data.data(), n, mImpl->nlist, 12,
-                     CoarseQuantizer::KmeansBackend::Auto);
+    // 25 coarse iterations (faiss's default): on glove +0.7pt coverage over 12
+    // at ~zero build cost (assignment is the fused GPU kernel; the update is a
+    // subsampled CPU pass). MFLAT_KMEANS_ITERS overrides for experiments.
+    int cqIters = kmeansIters > 0 ? kmeansIters : 25;
+    if (const char* e = std::getenv("MFLAT_KMEANS_ITERS")) cqIters = atoi(e);
+    mImpl->cq->train(data.data(), n, mImpl->nlist, cqIters,
+                     CoarseQuantizer::KmeansBackend::Auto,
+                     /*spherical=*/mImpl->metric == Metric::Cosine);
     mImpl->nlist   = mImpl->cq->nlist();
     mImpl->dbCount = n;
 

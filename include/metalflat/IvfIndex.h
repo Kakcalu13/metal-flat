@@ -43,7 +43,10 @@ public:
     // (v1 combines train + add; Faiss separates them.) For Cosine the
     // stored vectors are L2-normalized. O(n · nlist · dim · iters) — a
     // one-time build cost.
-    void build(const float* vectors, int n);
+    // kmeansIters: coarse k-means iterations; 0 = default (25, faiss's
+    // convention — worth it when the partition IS the product). Callers that
+    // only need a bootstrap partition (GraphIndex's self-search) pass less.
+    void build(const float* vectors, int n, int kmeansIters = 0);
 
     // The k nearest of `m` queries, scanning each query's `nprobe`
     // nearest cells. `nprobe` is clamped to [1, nlist] (nprobe == nlist
